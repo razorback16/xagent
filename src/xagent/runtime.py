@@ -1,0 +1,494 @@
+"""The in-kernel runtime: the surface the model programs against.
+
+Everything here executes inside the kernel process, in the same namespace as the
+model's own code. Harness-facing state lives in `_STATE` and is drained once per
+turn by a `probe()` that never appears in the model's transcript -- so control
+signals cost zero context.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from xagent.brief import MAX_CHARS, raw_write, safe_brief
+
+_STATE: dict = {
+    "done": None,        # one-tuple once done() is called, so None stays a legal answer
+    "notes": {},
+    "compress": None,
+    "ctx": {},
+    "spawned": 0,
+    # Filesystem mutations, recorded as they happen. Which files a session touched
+    # is a fact, and facts belong in a ledger rather than in summary prose -- the
+    # same reasoning that makes the variable table authoritative over the summary.
+    "files": {},
+}
+
+IGNORE_DIRS = {
+    ".git", ".venv", "venv", "__pycache__", "node_modules", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", "dist", "build", ".tox", ".idea", ".xagent",
+}
+
+_TOOL_NAMES: list[str] = []
+
+
+# --------------------------------------------------------------------- values
+
+
+@dataclass
+class Result:
+    """Outcome of a shell command."""
+
+    cmd: str
+    code: int
+    out: str = ""
+    err: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.code == 0
+
+    def lines(self) -> list[str]:
+        return self.out.splitlines()
+
+    def __repr__(self) -> str:
+        tag = "ok" if self.ok else f"exit={self.code}"
+        body = (self.out or self.err).strip()
+        first = body.split("\n")[0][:160] if body else ""
+        size = f", {len(body):,} chars" if len(body) > MAX_CHARS else ""
+        return f"<Result {tag}{size}> {first}"
+
+
+@dataclass
+class Hit:
+    """One grep match."""
+
+    path: str
+    line: int
+    text: str
+
+    def __repr__(self) -> str:
+        return f"{self.path}:{self.line}: {self.text.strip()[:120]}"
+
+
+# ------------------------------------------------------------------ filesystem
+
+
+# Reading any of these puts a live credential into the model's context, into the
+# CLI's stdout, and into any subagent it is seeded to. Blocked by default.
+SECRET_NAMES = {".env", ".netrc", ".npmrc", ".pypirc", "credentials", "id_rsa", "id_ed25519"}
+SECRET_PARTS = {".ssh", ".aws", ".gnupg", ".config/gcloud"}
+
+
+def _guard_secret(p: Path) -> None:
+    parts = set(p.parts)
+    if p.name in SECRET_NAMES or parts & {s.split("/")[0] for s in SECRET_PARTS}:
+        raise PermissionError(
+            f"{p} looks like a credential store and is blocked. If you genuinely "
+            f"need it, the operator must read it for you."
+        )
+
+
+def _resolve(path) -> Path:
+    p = Path(path).expanduser()
+    _guard_secret(p)
+    return p
+
+
+def read(path, lines: tuple[int, int] | None = None) -> str:
+    """Read a file. Returns the full text; display is capped, the value is not."""
+    p = _resolve(path)
+    text = p.read_text(errors="replace")
+    if lines:
+        start, end = lines
+        if start < 1:
+            raise ValueError(f"line numbers are 1-based; got start={start}")
+        text = "\n".join(text.splitlines()[start - 1 : end])
+    return text
+
+
+def write(path, text: str) -> str:
+    p = _resolve(path)
+    existed = p.exists()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    _record(p, "modified" if existed else "created", len(text))
+    return f"wrote {p} ({len(text):,} chars, {text.count(chr(10)) + 1:,} lines)"
+
+
+def edit(path, old: str, new: str, count: int = 1) -> str:
+    """Replace `old` with `new`. Raises unless `old` occurs exactly `count` times."""
+    p = _resolve(path)
+    # newline="" preserves the file's existing line endings; the default would
+    # rewrite every line of a CRLF file and turn a one-line edit into a full diff.
+    with open(p, newline="") as fh:
+        raw = fh.read()
+    found = raw.count(old)
+    if found != count:
+        raise ValueError(
+            f"{p}: expected {count} occurrence(s) of the target text, found {found}. "
+            "Widen the snippet until it is unique."
+        )
+    updated = raw.replace(old, new)
+    with open(p, "w", newline="") as fh:
+        fh.write(updated)
+    _record(p, "modified", len(updated))
+    return f"edited {p} ({found} replacement(s))"
+
+
+def _record(p: Path, action: str, size: int) -> None:
+    entry = _STATE["files"].setdefault(str(p), {"action": action, "edits": 0, "bytes": 0})
+    # A file created then edited is still "created" by this session.
+    if entry["action"] != "created":
+        entry["action"] = action
+    entry["edits"] += 1
+    entry["bytes"] = size
+
+
+def files_touched() -> dict:
+    """Every path this session wrote or edited, with how many times."""
+    return dict(_STATE["files"])
+
+
+def _file_ledger() -> str:
+    entries = _STATE["files"]
+    if not entries:
+        return ""
+    rows = []
+    for path, meta in sorted(entries.items()):
+        times = "" if meta["edits"] == 1 else f", {meta['edits']} writes"
+        rows.append(f"  {meta['action']:<9} {path}  ({meta['bytes']:,} bytes{times})")
+    return "\n".join(rows)
+
+
+def _emit_file_ledger() -> None:
+    raw_write(_file_ledger())
+
+
+def ls(path=".", depth: int = 1) -> list[str]:
+    root = _resolve(path)
+    out: list[str] = []
+    for entry in sorted(root.iterdir()):
+        if entry.name in IGNORE_DIRS or entry.name.startswith("."):
+            continue
+        if entry.is_dir():
+            out.append(f"{entry.name}/")
+            if depth > 1:
+                out.extend(f"{entry.name}/{c}" for c in ls(entry, depth - 1))
+        else:
+            out.append(entry.name)
+    return out
+
+
+def _walk(root: Path, glob: str):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for name in filenames:
+            full = Path(dirpath) / name
+            rel = full.relative_to(root)
+            if fnmatch.fnmatch(str(rel), glob) or fnmatch.fnmatch(name, glob):
+                yield full, rel
+
+
+def grep(pattern: str, glob: str = "*", path=".", ignore_case: bool = False,
+         fixed: bool = False, max_hits: int = 5000) -> list[Hit]:
+    """Search file contents. Returns every hit; bind it and reduce in Python."""
+    root = _resolve(path)
+    flags = re.IGNORECASE if ignore_case else 0
+    rx = re.compile(re.escape(pattern) if fixed else pattern, flags)
+    hits: list[Hit] = []
+    for full, rel in _walk(root, glob):
+        if full.name in SECRET_NAMES:
+            continue
+        try:
+            with full.open(errors="replace") as fh:
+                for n, line in enumerate(fh, 1):
+                    if rx.search(line):
+                        hits.append(Hit(str(rel), n, line.rstrip("\n")))
+                        if len(hits) >= max_hits:
+                            return hits
+        except (OSError, UnicodeDecodeError):
+            continue
+    return hits
+
+
+def files(glob: str = "*", path=".") -> list[str]:
+    """Paths matching a glob, ignoring the usual noise directories."""
+    return [str(rel) for _, rel in _walk(_resolve(path), glob)]
+
+
+def sh(cmd: str, timeout: float = 120, cwd=None) -> Result:
+    """Run a shell command. Never raises on non-zero exit; inspect `.code`."""
+    try:
+        proc = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            timeout=timeout, cwd=str(cwd) if cwd else None,
+        )
+        return Result(cmd, proc.returncode, proc.stdout, proc.stderr)
+    except subprocess.TimeoutExpired as e:
+        return Result(cmd, 124, e.stdout or "", f"timed out after {timeout}s")
+
+
+# ------------------------------------------------------------ context control
+
+
+def peek(x, n: int = 40, width: int = 200) -> None:
+    """Print a slice of a held value. Deliberately bypasses the display cap."""
+    if isinstance(x, str):
+        body = x.splitlines()
+        shown, total, unit = body[:n], len(body), "lines"
+    elif isinstance(x, dict):
+        items = list(x.items())[:n]
+        shown = [f"{k!r}: {v!r}" for k, v in items]
+        total, unit = len(x), "keys"
+    elif isinstance(x, (list, tuple, set, frozenset)):
+        seq = list(x)
+        shown, total, unit = [repr(i) for i in seq[:n]], len(seq), "items"
+    elif hasattr(x, "__iter__") and not isinstance(x, bytes):
+        # Never list() an arbitrary iterable: it consumes generators (destroying
+        # the value being inspected) and never returns on an unbounded one.
+        import itertools
+
+        head = list(itertools.islice(iter(x), n))
+        shown, total, unit = [repr(i) for i in head], len(head), "items (lazy — not consumed past this)"
+    else:
+        shown, total, unit = [repr(x)], 1, "value"
+    # Write past the cell budget deliberately -- but report the true count. The
+    # previous version printed through the budget while claiming full coverage,
+    # so the model was told it had seen everything when it had seen the head.
+    body, used, budget = [], 0, 8000
+    for i, line in enumerate(shown):
+        clipped = line[:width]
+        if used + len(clipped) > budget:
+            shown = shown[:i]
+            break
+        body.append(clipped)
+        used += len(clipped) + 1
+    header = f"[peek {len(body)}/{total} {unit}]"
+    if len(body) < min(n, total):
+        header += f" — stopped at the peek budget; slice it directly for more"
+    raw_write(header + "\n" + "\n".join(body) + "\n")
+    if total > len(body):
+        raw_write(f"… {total - len(body):,} more {unit}\n")
+
+
+def note(key: str, text: str | None = None):
+    """Pin a fact to the top of the context. Survives every compaction.
+
+    Use it for anything you must not lose: the goal, a constraint you discovered,
+    a decision you made. Call with no text to read a note back.
+    """
+    if text is None:
+        return _STATE["notes"].get(key)
+    _STATE["notes"][str(key)] = str(text)
+    return f"noted {key!r} ({len(_STATE['notes'])} note(s) pinned)"
+
+
+def ctx() -> None:
+    """Print the live token budget: what your context is costing, and where."""
+    info = _STATE.get("ctx") or {}
+    if not info:
+        print("[no accounting yet — available from the second turn onward]")
+        return
+    used, budget = info.get("used", 0), info.get("budget", 1)
+    pct = 100.0 * used / max(budget, 1)
+    bar = "█" * int(pct // 5) + "░" * (20 - int(pct // 5))
+    print(f"context  {bar} {used:,} / {budget:,} tokens ({pct:.0f}%)")
+    print(f"cells    {info.get('live', 0)} live, {info.get('folded', 0)} folded, "
+          f"{info.get('evicted', 0)} evicted")
+    print(f"notes    {len(_STATE['notes'])} pinned")
+    if info.get("cache_read") is not None:
+        print(f"cache    {info['cache_read']:,} read, {info.get('cache_write', 0):,} written")
+    top = info.get("heaviest") or []
+    if top:
+        print("heaviest cells:")
+        for cell_id, tokens in top:
+            print(f"  cell {cell_id}: ~{tokens:,} tokens")
+    if pct >= 70:
+        print("→ consider compress() — your variables survive it intact")
+
+
+def compress(mode: str = "evict", before: int | None = None) -> str:
+    """Compact your own context. Variables stay live and exact.
+
+    mode="fold"   drop the *outputs* of old cells, keep the code (cheap, reversible
+                  in effect: you can re-run anything).
+    mode="evict"  replace old cells with a summary of what the code did plus a
+                  freshly introspected table of every live variable.
+
+    `before` limits it to cells older than that id; the default protects the most
+    recent cells so the cache-warm tail of the prompt is left alone.
+    """
+    if mode not in ("fold", "evict"):
+        raise ValueError("mode must be 'fold' or 'evict'")
+    _STATE["compress"] = {"mode": mode, "before": before}
+    return f"[compression queued: {mode}] — applied after this cell completes"
+
+
+def done(value=None):
+    """Finish. `value` is returned to whoever asked (the user, or a parent agent)."""
+    _STATE["done"] = (value,)
+    return f"[done] {safe_brief(value)}"
+
+
+# ---------------------------------------------------------------- subagents
+
+
+def agent(prompt: str, *, seed: dict | None = None, model: str | None = None,
+          max_turns: int = 30, label: str | None = None):
+    """Spawn a subagent with its own kernel and its own context window.
+
+    It starts fresh: it sees `prompt` and whatever you hand it in `seed`, nothing
+    else. Returns immediately with a Handle; call `.result()` or `gather()`.
+
+        hs = [agent(f"audit {f} for SQL injection", seed={"src": read(f)}) for f in fs]
+        for r in gather(hs): ...
+
+    Your context grows by one line no matter how many you spawn -- that is the
+    point. Whatever the subagent passes to `done()` comes back as a real Python
+    object, so you can filter and re-dispatch without re-reading anything.
+    """
+    from xagent.spawn import spawn
+
+    return spawn(prompt, seed=seed, model=model, max_turns=max_turns, label=label)
+
+
+def gather(handles, timeout: float | None = None) -> list:
+    """Block until every handle resolves; results keep the input order.
+
+    `timeout` is a deadline for the whole batch, not for each handle in turn.
+    A failed subagent yields an AgentError in its slot rather than raising, so one
+    bad apple does not discard the batch.
+    """
+    import time
+
+    handles = list(handles)
+    deadline = (time.monotonic() + timeout) if timeout else None
+    out = []
+    for h in handles:
+        left = max(0.0, deadline - time.monotonic()) if deadline else None
+        out.append(h.result(timeout=left))
+    return out
+
+
+# ------------------------------------------------------- harness-side hooks
+
+
+def _user_vars() -> dict:
+    ip = _ipython()
+    if ip is None:
+        return {}
+    hidden = set(_TOOL_NAMES) | {"In", "Out", "get_ipython", "exit", "quit", "open"}
+    return {
+        k: v
+        for k, v in ip.user_ns.items()
+        if not k.startswith("_") and k not in hidden and not callable_module(v)
+    }
+
+
+def callable_module(v) -> bool:
+    """True for modules and for the injected tool callables themselves.
+
+    Deliberately not `v.__module__ == "xagent.runtime"`: an *instance* of a
+    dataclass defined here answers that too (attribute lookup falls through to the
+    class), which hid every Result and Hit the model held from the variable table.
+    """
+    if isinstance(v, type(sys)):
+        return True
+    return callable(v) and getattr(v, "__module__", None) == "xagent.runtime"
+
+
+def _var_table() -> str:
+    """A factual inventory of live state. Regenerated on demand, so it cannot lie."""
+    rows = []
+    for name, val in sorted(_user_vars().items()):
+        try:
+            desc = safe_brief(val).split("\n")[0][:150]
+        except Exception:
+            desc = f"<{type(val).__name__}>"
+        size = ""
+        try:
+            size = f" len={len(val):,}" if hasattr(val, "__len__") else ""
+        except Exception:
+            pass
+        rows.append(f"  {name:<22} {type(val).__name__:<12}{size}  {desc}")
+    if not rows:
+        return "  (no user variables)"
+    return "\n".join(rows)
+
+
+def _signals() -> str:
+    """Drain pending control signals. Called by the harness, never by the model."""
+    payload = {
+        "done": _STATE["done"] is not None,
+        "done_brief": safe_brief(_STATE["done"][0]) if _STATE["done"] else None,
+        "compress": _STATE["compress"],
+        "notes": dict(_STATE["notes"]),
+        "spawned": _spawn_count(),
+        "vars": len(_user_vars()),
+    }
+    _STATE["compress"] = None
+    return json.dumps(payload)
+
+
+def _emit_signals() -> None:
+    """Hand the harness its control payload, off the budgeted path."""
+    raw_write(_signals())
+
+
+def _emit_var_table() -> None:
+    raw_write(_var_table())
+
+
+def _spawn_count() -> int:
+    try:
+        from xagent import spawn as _s
+
+        return _s._spawned
+    except Exception:
+        return 0
+
+
+def _set_ctx(info: dict) -> None:
+    _STATE["ctx"] = info
+
+
+def _ipython():
+    try:
+        from IPython import get_ipython
+
+        return get_ipython()
+    except Exception:
+        return None
+
+
+PUBLIC = [
+    read, write, edit, ls, files, files_touched, grep, sh,
+    peek, note, ctx, compress, done, agent, gather,
+    Result, Hit,
+]
+
+
+def install(ns: dict) -> None:
+    """Seed the model-facing surface into the kernel's user namespace."""
+    for obj in PUBLIC:
+        ns[obj.__name__] = obj
+        _TOOL_NAMES.append(obj.__name__)
+    ns["Path"] = Path
+    ns["re"] = re
+    ns["json"] = json
+    _TOOL_NAMES.extend(["Path", "re", "json"])
+
+    seed_path = os.environ.get("XAGENT_SEED")
+    if seed_path and Path(seed_path).is_file():
+        import cloudpickle
+
+        with open(seed_path, "rb") as fh:
+            ns.update(cloudpickle.load(fh))

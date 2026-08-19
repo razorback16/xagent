@@ -1,0 +1,22 @@
+[project]
+name = "xagent"
+version = "0.1.0"
+description = "An LLM harness whose context window is a Python REPL"
+readme = "README.md"
+authors = [
+    { name = "Razorback16", email = "razorback16@protonmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.122.0",
+    "cloudpickle>=3.1.2",
+    "ipykernel>=7.3.0",
+    "jupyter-client>=8.9.1",
+]
+
+[project.scripts]
+xagent = "xagent.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.2,<0.11.0"]
+build-backend = "uv_build"
