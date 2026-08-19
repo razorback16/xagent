@@ -11,9 +11,12 @@ import re
 import sys
 from pathlib import Path
 
+from xagent import config
 from xagent.compress import Compressor
 from xagent.context import MAX_CODE_CHARS, ContextStore
 from xagent.kernel import Kernel
+from xagent.prompts import SYSTEM
+from xagent.provider import Provider, Usage
 
 PASS, FAIL = [], []
 
@@ -180,6 +183,73 @@ def main() -> int:
         check("the file ledger rides the tail too",
               "new_mod.py" in json.dumps(store3.messages()[-1])
               and "new_mod.py" not in json.dumps(store3.messages()[0]))
+
+        print("\nmulti-tool turn: a stray `sh` block arriving after a good `python`")
+        print("                 call overwrote it, so the cell was silently discarded")
+
+        class _Block:
+            def __init__(self, name, ident, code):
+                self.type, self.name, self.id = "tool_use", name, ident
+                self.input = {"code": code}
+
+        class _Usage:
+            input_tokens = 1
+            cache_read_input_tokens = 0
+            cache_creation_input_tokens = 0
+
+        class _Resp:
+            stop_reason = "tool_use"
+            usage = _Usage()
+
+            def __init__(self, blocks):
+                self.content = blocks
+
+        def assemble(blocks):
+            prov = Provider.__new__(Provider)
+            prov.usage = Usage()
+            prov.calls = 0
+            prov.on_delta = None
+            prov._code_seen = ""
+            prov._create = lambda **kw: _Resp(blocks)
+            prov.backend = config.BACKENDS["codiv"]
+            prov.model = "m"
+            prov.thinking = None
+            prov.sampling = "thinking"
+            return prov._sample_once("sys", [], 1024)
+
+        py, sh = _Block("python", "tu_py", "x = 1"), _Block("sh", "tu_sh", "ls")
+        turn = assemble([py, sh])
+        check("the python call is the one acted on", turn.tool_name == "python", str(turn.tool_name))
+        check("its code survives the stray block", turn.code == "x = 1", repr(turn.code))
+        check("its own tool_use_id is kept", turn.tool_use_id == "tu_py", str(turn.tool_use_id))
+        check("the stray tool is reported, not acted on", turn.ignored_tools == ["sh"],
+              str(turn.ignored_tools))
+
+        turn = assemble([sh, py])
+        check("order does not matter: python still wins", turn.code == "x = 1", repr(turn.code))
+        check("and sh is still reported", turn.ignored_tools == ["sh"], str(turn.ignored_tools))
+
+        turn = assemble([sh])
+        check("a lone unknown tool is still surfaced for correction",
+              turn.tool_name == "sh" and not turn.ignored_tools, str(turn.tool_name))
+
+        print("\nsystem prompt: `sh`/`done` were listed under a heading calling them")
+        print("               \"tools\", and the model duly emitted them as tool calls")
+        check("names `python` as the one tool that exists",
+              "only tool that exists" in SYSTEM and "`python`" in SYSTEM)
+        check("says plainly they are Python functions, not tools",
+              "not a tool" in SYSTEM)
+        check("no heading offers them as tools",
+              "Tools available" not in SYSTEM, "heading still calls them tools")
+        for name in ("sh", "done", "bash"):
+            check(f"warns that a {name!r} tool call is rejected", name in SYSTEM.split(
+                "# How a cell runs")[0])
+
+        print("\n               an unescaped \\n in the docstring split the code example")
+        print("               that teaches how to write large files")
+        check("no raw newline inside a string-literal example",
+              '"\n".join' not in SYSTEM, "a code example is broken across lines")
+        check("triple quotes in examples are balanced", SYSTEM.count('\"\"\"') % 2 == 0)
 
     finally:
         k.shutdown()

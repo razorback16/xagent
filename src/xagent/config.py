@@ -25,6 +25,21 @@ CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
 # Extended-thinking budgets in tokens, by level.
 THINKING_BUDGETS = {"low": 2048, "medium": 8192, "high": 24576}
+# Applied when the caller names no level. `off` is the only way to disable it, so
+# that "unspecified" and "deliberately none" stay distinguishable across the
+# subagent env handoff -- otherwise a child re-defaults to the level its parent
+# had just turned off.
+DEFAULT_THINKING = "medium"
+THINKING_OFF = "off"
+THINKING_CHOICES = (*sorted(THINKING_BUDGETS), THINKING_OFF)
+
+
+def resolve_thinking(name: str | None) -> str | None:
+    """Level to actually use. None means unspecified; `off` means none."""
+    if name is None:
+        return DEFAULT_THINKING
+    return name if name in THINKING_BUDGETS else None
+
 
 # Sampling presets recommended for Qwen 3.8. `extra` holds the parameters the
 # Anthropic wire format has no field for; they ride in extra_body, which the

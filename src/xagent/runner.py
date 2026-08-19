@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from xagent import config
 from xagent.compress import Compressor
 from xagent.context import ContextStore
 from xagent.kernel import Kernel, is_secret_key
@@ -78,6 +79,11 @@ class Runner:
         self.compressor = Compressor(self.provider, budget=self.budget)
         self.kernel: Kernel | None = None
         self._seed_file: str | None = None
+        # Only a watched run relays deltas. Subagents build their own Provider and
+        # leave this unset, so parallel fan-out cannot interleave into one stream.
+        if on_event is not None:
+            self.provider.on_delta = lambda part, text: self._emit(
+                "delta", part=part, text=text)
 
     # ------------------------------------------------------------------- setup
 
@@ -88,8 +94,9 @@ class Runner:
         env["XAGENT_DEPTH"] = str(self.depth)
         env["XAGENT_PROVIDER"] = self.provider.backend.name
         env["XAGENT_MODEL"] = self.provider.model
-        if self.provider.thinking:
-            env["XAGENT_THINKING"] = self.provider.thinking
+        # Always set, `off` included: an unset variable reads as "unspecified" to
+        # the child, which would then re-apply the default the parent disabled.
+        env["XAGENT_THINKING"] = self.provider.thinking or config.THINKING_OFF
         env["XAGENT_SAMPLING"] = self.provider.sampling
         # Always clear it first: the environment is inherited from this kernel,
         # which may itself have been seeded, and a stale XAGENT_SEED would hand a
@@ -149,6 +156,9 @@ class Runner:
             self._push_accounting()
             self._refresh_live_vars()
 
+            # Announced before sampling, not after: on a long turn this header is
+            # the only thing on screen until the first token arrives.
+            self._emit("turn_start", n=turn_no, tokens=self.store.real_tokens)
             turn = self.provider.sample(self.store.system, self.store.messages())
             self.store.observe(turn.input_tokens + turn.cache_read + turn.cache_write)
             self.store.cache_read += turn.cache_read
@@ -168,6 +178,8 @@ class Runner:
                 return result
 
             if turn.tool_name and turn.tool_name != "python":
+                # Reached only when the turn had no `python` call at all; a stray
+                # tool alongside a real one is handled after execution instead.
                 self.store.add(
                     code="", output=f"[unknown tool {turn.tool_name!r}. The only tool is "
                                     f"`python`; pass your code as its `code` argument.]",
@@ -200,9 +212,18 @@ class Runner:
 
             empty = 0
             output = self.kernel.execute(turn.code)
+            rendered = output.render()
+            if turn.ignored_tools:
+                # The python call still ran; say what was dropped so the model
+                # stops reaching for a tool it does not have, without costing it
+                # the cell it just wrote.
+                names = ", ".join(sorted(set(turn.ignored_tools)))
+                rendered += (f"\n\n[also called {names} in this turn — ignored. "
+                             f"The only tool is `python`.]")
+                self._emit("warning", message=f"ignored extra tool call(s): {names}")
             cell = self.store.add(
                 code=turn.code,
-                output=output.render(),
+                output=rendered,
                 tool_use_id=turn.tool_use_id or f"tu_{turn_no}",
                 thought=turn.text,
                 thinking_blocks=turn.thinking_blocks,

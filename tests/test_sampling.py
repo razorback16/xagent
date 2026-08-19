@@ -74,11 +74,14 @@ def main() -> int:
     check("no top_k", "top_k" not in an)
     check("no extra_body payload", not an.get("extra_body"), str(an.get("extra_body")))
 
-    print("\nextended thinking displaces the sampling distribution")
+    print("\nextended thinking rides alongside the sampling preset")
     et = capture(backend="codiv", thinking="high", sampling="thinking")
-    check("temperature dropped when thinking is on", "temperature" not in et)
-    check("top_p dropped when thinking is on", "top_p" not in et)
-    check("top_k dropped when thinking is on", "top_k" not in et)
+    # SGLang accepts both together (verified: 200 on thinking + top_p/top_k), and it
+    # is the only backend that is sent sampling at all -- so thinking being on by
+    # default must not cost qwen its recommended preset.
+    check("temperature survives thinking", et.get("temperature") == 1.0, str(et.get("temperature")))
+    check("top_p survives thinking", et.get("top_p") == 0.95)
+    check("top_k survives thinking", et.get("top_k") == 20)
     check("thinking block sent", et.get("thinking", {}).get("type") == "enabled")
     check("budget_tokens is the 'high' budget",
           et["thinking"]["budget_tokens"] == config.THINKING_BUDGETS["high"],
@@ -86,6 +89,23 @@ def main() -> int:
     check("budget_tokens stays under max_tokens",
           et["thinking"]["budget_tokens"] < et["max_tokens"])
     check("extra_body survives alongside thinking", bool(et.get("extra_body")))
+
+    print("\nthinking is on by default, and `off` is the only way out")
+    for backend in ("anthropic", "codiv"):
+        default = capture(backend=backend)
+        check(f"{backend}: unspecified → the default level",
+              default.get("thinking", {}).get("budget_tokens")
+              == config.THINKING_BUDGETS[config.DEFAULT_THINKING],
+              str(default.get("thinking")))
+        check(f"{backend}: `off` sends no thinking block",
+              "thinking" not in capture(backend=backend, thinking="off"),
+              str(capture(backend=backend, thinking="off").get("thinking")))
+    check("default level is medium", config.DEFAULT_THINKING == "medium")
+    check("`off` resolves to no level", config.resolve_thinking("off") is None)
+    check("unspecified resolves to the default",
+          config.resolve_thinking(None) == config.DEFAULT_THINKING)
+    check("a named level resolves to itself", config.resolve_thinking("low") == "low")
+    check("`off` is offered on the command line", "off" in config.THINKING_CHOICES)
 
     print("\n128k output ceiling")
     for backend in ("anthropic", "codiv"):
