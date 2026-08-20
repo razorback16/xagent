@@ -341,5 +341,5 @@ src/xagent/
   runner.py    the sample -> execute -> append loop
   spawn.py     subagents, cloudpickle seeding
   prompts.py   the system prompt
-  cli.py       entry point
+  cli.py       entry point, and the rich-rendered transcript
 ```

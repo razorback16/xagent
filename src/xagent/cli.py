@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import argparse
-import pprint
+import re
+import shutil
 import sys
 import textwrap
 from pathlib import Path
 
+from rich.console import Console
+from rich.highlighter import ReprHighlighter
+from rich.markdown import Markdown
+from rich.pretty import Pretty
+from rich.syntax import Syntax
+from rich.text import Text
+from rich.theme import Theme
+
 from xagent import config
+from xagent.kernel import strip_ansi
 from xagent.provider import Provider
 from xagent.runner import MAX_TURN_BLOCKS, MAX_TURNS, Runner
 
@@ -31,6 +41,179 @@ SECTIONS = {
     "text": ("  ", None),
     "code": ("  │ ", "cyan"),
 }
+# Tools whose "code" is not python, so it is not lexed as python.
+SHELL_TOOLS = {"sh", "bash", "shell"}
+
+# rich does the rendering; this file keeps the gutters. Every renderable is
+# captured and then written out line by line behind the same prefix the raw
+# stream uses, so markdown and highlighting arrive *inside* the transcript
+# rather than as a widget dropped on top of it.
+CODE_THEME = "ansi_dark"   # the terminal's own 16 colours, so the user's theme wins
+# rich sets inline code on a black background, which is only legible if the
+# terminal happens to be dark too. Everything here paints foregrounds and leaves
+# the background to whoever chose it.
+MD_STYLES = Theme({"markdown.code": "bold cyan", "markdown.item.bullet": "cyan",
+                   "markdown.item.number": "cyan"}, inherit=True)
+FALLBACK_WIDTH = 100       # when stdout is a file and so has no width of its own
+
+LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s")
+FENCES = ("```", "~~~")
+
+
+class Renderer:
+    """Writes a rich renderable into one of the transcript's gutters."""
+
+    def __init__(self, colour: bool):
+        self.colour = colour
+        self.c = paint(colour)
+        self.console = Console(
+            # Pinned rather than sniffed: the console renders into a capture
+            # buffer, so left to itself it would decide there is no terminal here
+            # and drop the colour on the way to one that has it.
+            color_system="truecolor" if colour else None,
+            force_terminal=colour or None,
+            highlight=False, markup=False, emoji=False, theme=MD_STYLES,
+        )
+        self.highlighter = ReprHighlighter()
+
+    def block(self, renderable, prefix: str, tone: str | None = None, *,
+              style: str | None = None, wrap: bool = True) -> None:
+        # The gutter is printed rather than rendered, so the width rich wraps to
+        # is the terminal's minus the room the gutter takes out of it.
+        columns = shutil.get_terminal_size((FALLBACK_WIDTH, 24)).columns
+        self.console.width = max(20, columns - len(prefix) - 1)
+        with self.console.capture() as capture:
+            # soft_wrap also turns cropping off: output that has to survive intact
+            # (a cell's, a traceback's) is written at its own width and left to the
+            # terminal, rather than cut to the console's.
+            self.console.print(renderable, style=style, soft_wrap=not wrap)
+        lines = capture.get().split("\n")
+        # rich separates its elements with a blank line above and below. Rendering
+        # a block at a time turns those into a gap at every seam, on top of the
+        # one this printer puts between blocks itself.
+        while lines and not strip_ansi(lines[0]).strip():
+            lines.pop(0)
+        while lines and not strip_ansi(lines[-1]).strip():
+            lines.pop()
+        if not lines:
+            return
+        gutter = self.c(prefix, tone) if tone else prefix
+        for line in lines:
+            sys.stdout.write(gutter + line.rstrip() + "\n")
+        sys.stdout.flush()
+
+
+def split_block(buf: str) -> tuple[str | None, str]:
+    """The first *finished* markdown block in `buf`, and what is left after it.
+
+    Finished means a blank line outside a fenced code block. Until one arrives a
+    heading is still an ordinary paragraph and a table is still one stray row, so
+    rendering early gets the block wrong rather than getting it early.
+    """
+    lines = buf.split("\n")
+    fence = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith(FENCES):
+            fence = not fence
+            continue
+        # The last element is whatever follows the final newline -- a line still
+        # being written, not a blank one -- so it never closes a block.
+        if fence or line.strip() or not i or i == len(lines) - 1:
+            continue
+        return "\n".join(lines[:i]), "\n".join(lines[i + 1:])
+    return None, buf
+
+
+class Prose:
+    """Buffers streamed prose and renders it a finished markdown block at a time.
+
+    Markdown cannot be rendered a token at a time, and holding the whole turn back
+    to render it at the end would undo the streaming. A block is the unit that is
+    both complete and soon.
+    """
+
+    def __init__(self, renderer: Renderer, prefix: str, tone: str | None = None,
+                 style: str | None = None):
+        self.renderer, self.prefix, self.tone = renderer, prefix, tone
+        self.style = style
+        self.buf, self.pending, self.wrote = "", [], False
+
+    def feed(self, text: str) -> None:
+        self.buf += text
+        while True:
+            block, rest = split_block(self.buf)
+            if block is None:
+                return
+            self.buf = rest
+            self.take(block)
+
+    def close(self) -> None:
+        if self.buf.strip():
+            self.take(self.buf)
+        self.buf = ""
+        self.flush_pending()
+        self.wrote = False
+
+    def take(self, block: str) -> None:
+        if not block.strip():
+            return
+        # A list is held whole: rendered a block at a time, every item of a loose
+        # ordered list is a list of its own, and they all start again at 1.
+        if LIST_ITEM.match(block) or (self.pending and block[:1] in (" ", "\t")):
+            self.pending.append(block)
+            return
+        self.flush_pending()
+        self.emit(block)
+
+    def flush_pending(self) -> None:
+        if self.pending:
+            self.emit("\n\n".join(self.pending))
+            self.pending = []
+
+    def emit(self, text: str) -> None:
+        if self.wrote:
+            sys.stdout.write("\n")   # the gap a whole-document render would leave
+        self.renderer.block(Markdown(text.strip("\n"), code_theme=CODE_THEME),
+                            self.prefix, self.tone, style=self.style)
+        self.wrote = True
+
+
+class Code:
+    """Buffers streamed code and highlights it a finished line at a time.
+
+    The last line in the buffer may still be half-written, so it is held back.
+    Everything above it is re-lexed on every delta and only the new lines are
+    printed -- so a line is never highlighted against code the model has not
+    written yet, and never rewritten once it is on screen.
+    """
+
+    def __init__(self, renderer: Renderer, prefix: str, tone: str | None = None):
+        self.renderer, self.prefix, self.tone = renderer, prefix, tone
+        self.lexer = "python"
+        self.buf, self.printed = "", 0
+
+    def feed(self, text: str) -> None:
+        self.buf += text
+        self.drain(final=False)
+
+    def close(self) -> None:
+        self.drain(final=True)
+        self.buf, self.printed = "", 0
+
+    def drain(self, final: bool) -> None:
+        lines = self.buf.split("\n")
+        ready = len(lines) if final else len(lines) - 1
+        while final and ready > self.printed and not lines[ready - 1].strip():
+            ready -= 1        # a cell's trailing newlines are not lines of code
+        if ready <= self.printed:
+            return
+        self.renderer.block(
+            Syntax("\n".join(lines[:ready]), self.lexer, theme=CODE_THEME,
+                   background_color="default", word_wrap=True,
+                   line_range=(self.printed + 1, ready)),
+            self.prefix, self.tone)
+        self.printed = ready
+
 
 # Reasoning is counted in characters as it streams -- the token count is only
 # known once the turn ends, and a live counter is worth more than an exact one.
@@ -44,12 +227,44 @@ LOG_TICK_TOKENS = 1_000
 
 def make_printer(colour, verbose: bool, live_updates: bool = True):
     c = paint(colour)
-    # `section` is the kind currently being streamed, `bol` whether the cursor sits
-    # at the start of a line and so still owes a prefix, `streamed` whether this
-    # turn was shown live (in which case the turn summary must not repeat it).
+    renderer = Renderer(colour)
+    # One buffer per kind of streamed output. Each holds the stream until a piece
+    # of it is finished -- a markdown block, a line of code -- and only then hands
+    # that piece to rich, because neither can be rendered a token at a time.
+    buffers = {
+        "text": Prose(renderer, *SECTIONS["text"]),
+        "thinking": Prose(renderer, *SECTIONS["thinking"], style="dim"),
+        "code": Code(renderer, *SECTIONS["code"]),
+    }
+    # `section` is the kind currently being streamed, `streamed` whether this turn
+    # was shown live (in which case the turn summary must not repeat it).
     # `think_chars` accumulates the reasoning collapsed into a single line.
-    live = {"section": None, "bol": True, "streamed": False, "tool": None,
+    live = {"section": None, "streamed": False, "tool": None,
             "think_chars": 0, "logged_at": 0}
+
+    def show(text: str, kind: str, limit: int) -> None:
+        """Render a whole block of prose that never streamed -- a turn summary."""
+        body = text.strip()
+        if len(body) > limit:
+            body = body[:limit] + " …"
+        prose = Prose(renderer, *SECTIONS[kind],
+                      style="dim" if kind == "thinking" else None)
+        prose.feed(body)
+        prose.close()
+
+    def dump(text: str, prefix: str, tone: str, limit: int, highlight: bool) -> None:
+        """Render a cell's output: highlighted, but never reflowed or cut short.
+
+        The output is what the model read. Wrapping it here would put line breaks
+        in the transcript that were not in the cell, so it goes out at its own
+        width and the terminal deals with it.
+        """
+        body = text.strip()
+        if len(body) > limit:
+            body = body[:limit] + " …"
+        shown = Text(body)
+        renderer.block(renderer.highlighter(shown) if highlight else shown,
+                       prefix, tone, wrap=False)
 
     def think_tokens() -> int:
         return live["think_chars"] // CHARS_PER_TOKEN
@@ -62,7 +277,7 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
         """
         if live["section"] != "thinking":
             close_section()
-            live["section"], live["bol"] = "thinking", False
+            live["section"] = "thinking"
             live["logged_at"] = 0
         live["streamed"] = True
         live["think_chars"] += len(text)
@@ -84,19 +299,22 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
         return textwrap.indent(body, prefix)
 
     def close_section() -> None:
-        if live["section"] == "thinking" and not verbose:
+        section = live["section"]
+        if section == "thinking" and not verbose:
             # Settle the collapsed counter into a final, permanent line.
             done = c(f"  ┊ thought ~{think_tokens():,} tok", "dim")
             sys.stdout.write(("\r" + done + "\033[K\n") if live_updates else (done + "\n"))
             sys.stdout.flush()
-            live["section"], live["bol"] = None, True
+            live["section"] = None
             return
-        if live["section"] is not None and not live["bol"]:
-            sys.stdout.write("\n")
-        live["section"], live["bol"] = None, True
+        if section is not None:
+            # Whatever the buffer was still holding for want of a finished block
+            # is finished now: the section it belongs to is over.
+            buffers[section].close()
+        live["section"] = None
 
     def stream(kind: str, text: str) -> None:
-        """Write a delta under its section header, re-prefixing every new line."""
+        """Feed a delta to its section's buffer, opening the section if needed."""
         if not text:
             return
         if kind == "thinking" and not verbose:
@@ -105,7 +323,7 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
         if live["section"] != kind and kind == "text":
             # qwen pads the gap between its reasoning and its tool call with
             # newlines. Opening a section on those prints a blank heading, and
-            # keeping them as a prefix indents the prose off its own first line.
+            # keeping them would open the prose on an empty line.
             text = text.lstrip("\n")
             if not text.strip():
                 return
@@ -115,28 +333,12 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
             if kind == "code":
                 # Name the tool the model actually called. Printing a fixed
                 # "python" here once hid a stray `sh` call behind a correct-
-                # looking header.
-                print(c(f"  ▸ {live['tool'] or 'python'}", "cyan"))
+                # looking header -- and would now highlight it as python too.
+                tool = live["tool"] or "python"
+                print(c(f"  ▸ {tool}", "cyan"))
+                buffers["code"].lexer = "bash" if tool in SHELL_TOOLS else "python"
         live["streamed"] = True
-        prefix, tone = SECTIONS[kind]
-        pieces = text.split("\n")
-        for i, piece in enumerate(pieces):
-            if i:
-                sys.stdout.write("\n")
-                live["bol"] = True
-            if not piece:
-                # Keep the gutter unbroken across blank lines -- but not on a
-                # chunk's trailing newline, which would leave a prefix dangling
-                # at the end of output that may be the last thing printed.
-                if live["bol"] and i < len(pieces) - 1:
-                    sys.stdout.write(c(prefix, tone) if tone else prefix)
-                    live["bol"] = False
-                continue
-            if live["bol"]:
-                sys.stdout.write(c(prefix, tone) if tone else prefix)
-                live["bol"] = False
-            sys.stdout.write(c(piece, tone) if tone else piece)
-        sys.stdout.flush()
+        buffers[kind].feed(text)
 
     def on_event(kind: str, data: dict) -> None:
         if kind == "kernel_ready":
@@ -164,12 +366,12 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
                 return  # already shown as it was generated
             if data.get("thinking"):
                 if verbose:
-                    print(indent(data["thinking"], c("  ┊ ", "dim"), 900))
+                    show(data["thinking"], "thinking", 900)
                 else:
                     approx = len(data["thinking"]) // CHARS_PER_TOKEN
                     print(c(f"  ┊ thought ~{approx:,} tok", "dim"))
             if data.get("text"):
-                print(indent(data["text"], "  ", 1200))
+                show(data["text"], "text", 1200)
             # One header per call: a turn that batched three of them ran three
             # cells, and printing only the first would credit the outputs below to
             # code that is not on screen.
@@ -177,7 +379,9 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
                 if not (code or "").strip():
                     continue
                 print(c("  ▸ python", "cyan"))
-                print(textwrap.indent(code.strip(), c("  │ ", "cyan")))
+                block = Code(renderer, *SECTIONS["code"])
+                block.feed(code.strip())
+                block.close()
         elif kind == "answer_start":
             close_section()
             live["streamed"] = False
@@ -193,12 +397,14 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
         elif kind == "answer":
             close_section()
             if not live["streamed"] and data.get("text"):
-                print(indent(data["text"], "  ", 4000))
+                show(data["text"], "text", 4000)
         elif kind == "cell":
             close_section()
             colour_name = "dim" if data["ok"] else "red"
             print(c("  ← output", colour_name))
-            print(indent(data["output"], c("  │ ", colour_name), 2000))
+            # A traceback is already coloured by being an error; running the repr
+            # highlighter over it would only pick out the numbers inside it.
+            dump(data["output"], "  │ ", colour_name, 2000, highlight=data["ok"])
         elif kind == "compaction":
             close_section()
             tag = "requested" if data.get("requested") else "forced"
@@ -286,9 +492,13 @@ def main(argv: list[str] | None = None) -> int:
     # left to print is a value passed to done() by a run that produced no prose --
     # a subagent-shaped finish at the top level, or an answer turn that failed.
     if not result.answer and result.value is not None:
-        rendered = (result.value if isinstance(result.value, str)
-                    else pprint.pformat(result.value, width=88))
-        print("\n" + textwrap.indent(rendered.strip()[:4000], "  "))
+        print()
+        renderer = Renderer(colour)
+        if isinstance(result.value, str):
+            renderer.block(Markdown(result.value.strip()[:4000], code_theme=CODE_THEME),
+                           "  ")
+        else:
+            renderer.block(Pretty(result.value, max_length=200, max_string=2000), "  ")
 
     usage = result.usage
     print(c(f"\n{result.turns} turns · {result.seconds:.0f}s · "

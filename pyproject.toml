@@ -15,6 +15,7 @@ dependencies = [
     "httpx>=0.28.1",
     "ipykernel>=7.3.0",
     "jupyter-client>=8.9.1",
+    "rich>=15.0.0",
 ]
 
 [project.scripts]

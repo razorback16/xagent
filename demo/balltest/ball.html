@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Bouncing Ball</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; display: grid; place-items: center; }
+  canvas { background: #1c1c24; border-radius: 8px; box-shadow: 0 0 40px #000; }
+</style>
+</head>
+<body>
+<canvas id="c" width="600" height="400"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height, R = 18;
+let x = W/2, y = H/3, vx = 3.2, vy = 0, g = 0.18, e = 0.92;
+
+function step() {
+  vy += g; x += vx; y += vy;
+  if (x < R && vx < 0)      { x = R; vx = -vx * e; }
+  if (x > W - R && vx > 0)  { x = W - R; vx = -vx * e; }
+  if (y > H - R && vy > 0)  {
+    y = H - R; vy = -vy * e;
+    // tiny nudge so the ball never fully stops
+    if (Math.abs(vy) < 2) vy = -4 - Math.random() * 2;
+  }
+  if (y < R && vy < 0)      { y = R; vy = -vy * e; }
+  draw();
+  requestAnimationFrame(step);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  // simple shadow under the ball
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.ellipse(x, H - 6, R * (1 - (H - y) / (H * 1.4)), R * 0.35, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // ball with radial highlight
+  const grad = ctx.createRadialGradient(x - R/3, y - R/3, R/6, x, y, R);
+  grad.addColorStop(0, '#ffb27a');
+  grad.addColorStop(1, '#e2452e');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(x, y, R, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+step();
+</script>
+</body>
+</html>
