@@ -249,15 +249,64 @@ def main() -> int:
               "new_mod.py" in json.dumps(store3.messages()[-1])
               and "new_mod.py" not in json.dumps(store3.messages()[0]))
 
+        print("\ncontext: a turn that made several calls is one assistant message,")
+        print("         because the API answers a message's tool_use blocks in the")
+        print("         single user message after it -- not one round each")
+
+        def unanswered(msgs):
+            """Every tool_use id in the transcript that no tool_result answers."""
+            missing = []
+            for i, msg in enumerate(msgs):
+                if msg["role"] != "assistant":
+                    continue
+                asked = [b["id"] for b in msg["content"] if b["type"] == "tool_use"]
+                nxt = msgs[i + 1] if i + 1 < len(msgs) else {"content": []}
+                answered = {b.get("tool_use_id") for b in nxt["content"]}
+                missing += [a for a in asked if a not in answered]
+            return missing
+
+        store4 = ContextStore(task="t", system="s")
+        store4.add("a()", "A", "tu_a", thought="both at once", turn=1)
+        store4.add("b()", "B", "tu_b", turn=1)
+        store4.add("c()", "C", "tu_c", turn=2)
+        msgs = store4.messages()
+        check("two turns and an opening, not three exchanges", len(msgs) == 5,
+              f"{len(msgs)} messages")
+        batched = msgs[1]["content"]
+        check("the batch carries both tool_use blocks, in order",
+              [b["id"] for b in batched if b["type"] == "tool_use"] == ["tu_a", "tu_b"],
+              str(batched))
+        check("with the prose written once above them, not per call",
+              sum(1 for b in batched if b["type"] == "text") == 1, str(batched))
+        check("and both results arrive in the one user message that follows",
+              [r["tool_use_id"] for r in msgs[2]["content"]] == ["tu_a", "tu_b"],
+              str(msgs[2]))
+        check("no tool_use goes unanswered, which the API rejects outright",
+              not unanswered(msgs), str(unanswered(msgs)))
+        store4.cells[0].state = "evicted"
+        check("an evicted call takes its own result with it",
+              not unanswered(store4.messages()), str(unanswered(store4.messages())))
+        store4.cells[1].state = "folded"
+        check("a folded one keeps its pair", not unanswered(store4.messages()),
+              str(unanswered(store4.messages())))
+        legacy = ContextStore(task="t", system="s")
+        legacy.add("f1()", "o", "t1")
+        legacy.add("f2()", "o", "t2")
+        check("a cell added without a turn is a turn of its own, as it always was",
+              len(legacy.turns(legacy.live())) == 2,
+              str([c.turn for c in legacy.cells]))
+
         print("\nmulti-tool turn: a stray `sh` block arriving after a good `python`")
         print("                 call overwrote it, so the cell was silently discarded")
 
         class _Block:
-            def __init__(self, name, ident, code):
+            def __init__(self, name, ident, code, timeout=None):
                 self.type, self.name, self.id = "tool_use", name, ident
                 # The finish carries no input at all, which is what lets it be a
                 # tool in the first place.
                 self.input = {} if code is None else {"code": code}
+                if timeout is not None:
+                    self.input["timeout"] = timeout
 
         class _Usage:
             input_tokens = 1
@@ -304,6 +353,44 @@ def main() -> int:
         turn = assemble([sh])
         check("a lone unknown tool is still surfaced for correction",
               turn.tool_name == "sh" and not turn.ignored_tools, str(turn.tool_name))
+
+        print("\nparallel calls: a second `python` block was reported as a stray and")
+        print("                its code discarded, so a turn that batched three")
+        print("                independent steps ran one and paid for three")
+        py2 = _Block("python", "tu_py2", "y = 2")
+        turn = assemble([py, py2])
+        check("both python calls are acted on",
+              [c.code for c in turn.calls] == ["x = 1", "y = 2"],
+              str([c.code for c in turn.calls]))
+        check("each keeps its own id, which is what the results are matched by",
+              [c.tool_use_id for c in turn.calls] == ["tu_py", "tu_py2"],
+              str([c.tool_use_id for c in turn.calls]))
+        check("neither is reported as a stray", turn.ignored_tools == [],
+              str(turn.ignored_tools))
+        check("and the scalar view still describes the first, as it always did",
+              turn.code == "x = 1" and turn.tool_use_id == "tu_py", repr(turn.code))
+
+        turn = assemble([py, sh, py2])
+        check("a stray between two calls costs neither of them",
+              [c.code for c in turn.calls] == ["x = 1", "y = 2"],
+              str([c.code for c in turn.calls]))
+        check("and is still reported once", turn.ignored_tools == ["sh"],
+              str(turn.ignored_tools))
+
+        slow = _Block("python", "tu_slow", "build()", timeout=45)
+        turn = assemble([py, slow])
+        check("a timeout is per call, not per turn",
+              [c.timeout for c in turn.calls] == [None, 45.0],
+              str([c.timeout for c in turn.calls]))
+
+        turn = assemble([py, _Block("done", "tu_d", None), py2])
+        check("a finish beside a batch keeps every call in it",
+              turn.done and [c.code for c in turn.calls] == ["x = 1", "y = 2"],
+              f"done={turn.done} calls={[c.code for c in turn.calls]}")
+        turn = assemble([py, py2], offer_done=False)
+        check("a subagent batches the same way",
+              [c.code for c in turn.calls] == ["x = 1", "y = 2"],
+              str([c.code for c in turn.calls]))
 
         print("\nprompt: the tool contract belongs in the tool description, which")
         print("        the chat template renders inside the <tools> block")

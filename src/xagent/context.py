@@ -45,6 +45,11 @@ class Cell:
     tool_use_id: str
     thought: str = ""
     state: str = "live"  # live | folded | evicted
+    # Which turn ran this cell. A turn that batched several calls produced
+    # several cells sharing one id, and they render as one assistant message --
+    # see `ContextStore.turns()`. Defaults to the cell's own number, which makes
+    # a cell added without one a turn of its own.
+    turn: int = 0
     # Raw thinking blocks, replayed verbatim when the backend demands it (Anthropic
     # rejects a tool-use continuation whose prior thinking blocks are missing).
     thinking_blocks: list[dict] = field(default_factory=list)
@@ -81,7 +86,7 @@ class ContextStore:
     # ------------------------------------------------------------------ cells
 
     def add(self, code: str, output: str, tool_use_id: str, thought: str = "",
-            thinking_blocks: list[dict] | None = None) -> Cell:
+            thinking_blocks: list[dict] | None = None, turn: int | None = None) -> Cell:
         if len(code) > MAX_CODE_CHARS:
             keep = MAX_CODE_CHARS // 2
             dropped = len(code) - 2 * keep
@@ -89,14 +94,37 @@ class ContextStore:
                     + f"\n\n# … [{dropped:,} chars of this cell elided from your context; "
                       f"it ran in full, and In[{len(self.cells) + 1}] holds the original] …\n\n"
                     + code[-keep:])
-        cell = Cell(n=len(self.cells) + 1, code=code, output=output,
+        n = len(self.cells) + 1
+        cell = Cell(n=n, code=code, output=output,
                     tool_use_id=tool_use_id, thought=thought,
-                    thinking_blocks=thinking_blocks or [])
+                    thinking_blocks=thinking_blocks or [],
+                    turn=n if turn is None else turn)
         self.cells.append(cell)
         return cell
 
     def live(self) -> list[Cell]:
         return [c for c in self.cells if c.state != "evicted"]
+
+    def turns(self, cells: list[Cell]) -> list[list[Cell]]:
+        """Cells batched back into the turns that ran them.
+
+        A turn that made several `python` calls is one assistant message however
+        many cells it ran: the API requires every tool_use block in a message to
+        be answered by a tool_result in the single user message that follows, so
+        a batch of three renders as three tool_use blocks and three results --
+        not as three conversational rounds the model never had.
+
+        Grouped by adjacency rather than by a dict, because cells are appended in
+        order and only neighbours can share a turn; a compacted span in the middle
+        simply ends the group, which is what it did to the turn as well.
+        """
+        groups: list[list[Cell]] = []
+        for cell in cells:
+            if groups and groups[-1][-1].turn == cell.turn:
+                groups[-1].append(cell)
+            else:
+                groups.append([cell])
+        return groups
 
     def by_state(self, state: str) -> list[Cell]:
         return [c for c in self.cells if c.state == state]
@@ -179,30 +207,38 @@ class ContextStore:
         # growing middle of the conversation stays cached.
         anchor = live[-2].n if len(live) >= 2 else None
 
-        for cell in live:
+        for group in self.turns(live):
             assistant: list[dict] = []
             if self.replay_thinking:
-                assistant.extend(cell.thinking_blocks)
-            if cell.thought.strip():
-                assistant.append({"type": "text", "text": cell.thought})
-            assistant.append({
-                "type": "tool_use",
-                "id": cell.tool_use_id,
-                "name": "python",
-                "input": {"code": cell.code},
-            })
+                for cell in group:
+                    assistant.extend(cell.thinking_blocks)
+            # The prose belongs to the turn, not to any one of its calls, so it is
+            # written once above the batch -- which is where the model wrote it.
+            thought = "\n".join(c.thought for c in group if c.thought.strip())
+            if thought.strip():
+                assistant.append({"type": "text", "text": thought})
+            for cell in group:
+                assistant.append({
+                    "type": "tool_use",
+                    "id": cell.tool_use_id,
+                    "name": "python",
+                    "input": {"code": cell.code},
+                })
             msgs.append({"role": "assistant", "content": assistant})
 
-            body = cell.shown_output
-            if cell is live[-1]:
-                body += self._notes_block()
-            result: dict = {
-                "type": "tool_result",
-                "tool_use_id": cell.tool_use_id,
-                "content": body,
-            }
-            if cell.n == anchor:
-                result["cache_control"] = CACHE
-            msgs.append({"role": "user", "content": [result]})
+            results: list[dict] = []
+            for cell in group:
+                body = cell.shown_output
+                if cell is live[-1]:
+                    body += self._notes_block()
+                result: dict = {
+                    "type": "tool_result",
+                    "tool_use_id": cell.tool_use_id,
+                    "content": body,
+                }
+                if cell.n == anchor:
+                    result["cache_control"] = CACHE
+                results.append(result)
+            msgs.append({"role": "user", "content": results})
 
         return msgs

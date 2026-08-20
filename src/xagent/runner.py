@@ -257,14 +257,20 @@ class Runner:
             self.store.cache_read += turn.cache_read
             self.store.cache_write += turn.cache_write
             self._emit("turn", n=turn_no, text=turn.text, thinking=turn.thinking,
-                       code=turn.code, tokens=self.store.real_tokens)
+                       code=turn.code, codes=[c.code for c in turn.calls],
+                       tokens=self.store.real_tokens)
             last_text = turn.text.strip() or last_text
             self._last_text = last_text
 
             finishing = turn.done and not self.is_subagent
-            has_cell = turn.tool_name == "python" and bool((turn.code or "").strip())
+            # Every `python` call the turn made, in order. More than one is a
+            # model batching independent steps, which the kernel takes as it
+            # takes any run of cells; the empty ones are dropped here so that a
+            # single blank call still reaches the recovery path below.
+            runnable = [c for c in turn.calls
+                        if c.name == "python" and (c.code or "").strip()]
 
-            if finishing and not has_cell:
+            if finishing and not runnable:
                 # The finish arrived with no cell to run, so the run ends here on
                 # the prose beside it. Checked before the no-tool-call branch
                 # below, because extracting the `done` block is exactly what
@@ -286,7 +292,7 @@ class Runner:
                 return self._finish(result, finish="done", text=turn.text,
                                     carried=stranded, cell=blank)
 
-            if turn.tool_use_id is None:
+            if not turn.calls:
                 # No tool call at all. Under the finishing contract the answer is
                 # the prose, and the call after it is only punctuation, so a model
                 # that writes the answer and stops has finished -- most of them do,
@@ -303,7 +309,7 @@ class Runner:
                 return self._finish(result, finish=finish, text=turn.text,
                                     carried=stranded)
 
-            if turn.tool_name and turn.tool_name != "python":
+            if not any(c.name == "python" for c in turn.calls):
                 # Reached only when the turn had no `python` call at all; a stray
                 # tool alongside a real one is handled after execution instead.
                 stranded = turn.text.strip() or stranded
@@ -313,12 +319,12 @@ class Runner:
                                     f"`{turn.tool_name}(...)` as Python in the `code` "
                                     f"argument instead.]",
                     tool_use_id=turn.tool_use_id, thought=turn.text,
-                    thinking_blocks=turn.thinking_blocks,
+                    thinking_blocks=turn.thinking_blocks, turn=turn_no,
                 )
                 self._emit("warning", message=f"unknown tool {turn.tool_name!r}; corrected")
                 continue
 
-            if not (turn.code or "").strip():
+            if not runnable:
                 # A tool call arrived with empty arguments. Some Anthropic-compatible
                 # servers do this intermittently. It is recoverable: say so in the
                 # tool_result and let the model try again.
@@ -336,74 +342,116 @@ class Runner:
                     tool_use_id=turn.tool_use_id,
                     thought=turn.text,
                     thinking_blocks=turn.thinking_blocks,
+                    turn=turn_no,
                 )
                 self._emit("warning", message=f"empty tool call (attempt {empty}); retrying")
                 continue
 
             empty = 0
-            # The kernel is primed to report on this cell, so what used to be two
-            # blocking probes per turn rides back on the cell itself.
-            want_vars = bool(self.store.state_report)
-            nonce = self._push_turn_context(want_vars)
-            # A cell that named its own timeout runs under it; everything else
-            # runs under the kernel's default.
-            cell_limit = {"timeout": turn.timeout} if turn.timeout else {}
-            if turn.timeout:
-                # Not a warning -- asking for longer is the supported thing to do
-                # -- but worth saying, so a cell that sits silent for ten minutes
-                # reads as intended rather than hung.
-                self._emit("note", message=f"cell timeout {turn.timeout:g}s")
-            started = time.time()
-            output = self.kernel.execute(turn.code, control_nonce=nonce, **cell_limit)
-            elapsed = time.time() - started
-            # Stranded prose expires here, at the next cell that runs -- unless this
-            # is the cell that finishes, which is the one turn it was being kept for.
+            # Stranded prose expires here, at the next cell that runs -- unless the
+            # turn finishes, which is the one turn it was being kept for.
             carried, stranded = stranded, ""
-            rendered = output.render()
-            if dropped := self._strays(turn):
-                # The python call still ran; say what was dropped so the model
-                # stops reaching for a tool it does not have, without costing it
-                # the cell it just wrote.
-                rendered += (f"\n\n[also called {dropped} in this turn — ignored. "
-                             f"{self._only_tools()}.]")
-                self._emit("warning", message=f"ignored extra tool call(s): {dropped}")
-            cell = self.store.add(
-                code=turn.code,
-                output=rendered,
-                tool_use_id=turn.tool_use_id or f"tu_{turn_no}",
-                thought=turn.text,
-                thinking_blocks=turn.thinking_blocks,
-            )
-            # The status line is written after the cell exists so the accounting it
-            # quotes includes the cell it is attached to -- a footer that described
-            # the context as it was before this output would be wrong by exactly
-            # the amount the model is trying to track.
-            cell.output = rendered + "\n\n" + self._status_line(elapsed)
-            result.turns = len(self.store.cells)
-            self._emit("cell", n=cell.n, output=cell.output, ok=output.ok)
-
-            payload = output.control
-            if payload is None or output.control_error:
-                # No payload, or one that arrived unusable. Rare enough to pay a
-                # probe for, and never worth proceeding on a half-read one.
-                payload = self._fallback_payload(want_vars, output.control_error)
-            signals = self._apply_payload(payload, want_vars)
-
-            if request := signals.get("compress"):
-                events = self.compressor.apply(
-                    self.store, self.kernel,
-                    mode=request.get("mode", "evict"), before=request.get("before"),
+            if len(runnable) > 1:
+                self._emit("note", message=(f"{len(runnable)} calls in this turn; "
+                                            f"running in order"))
+            cell = None
+            seen_ids: set[str] = set()
+            blank = sum(1 for c in turn.calls
+                        if c.name == "python" and not (c.code or "").strip())
+            for i, call in enumerate(runnable):
+                last = i == len(runnable) - 1
+                # The kernel is primed to report on this cell, so what used to be
+                # two blocking probes per turn rides back on the cell itself. The
+                # variable table walks and renders every user variable, so a batch
+                # asks for it once, on the cell whose answer is still current when
+                # the turn ends.
+                want_vars = bool(self.store.state_report) and last
+                nonce = self._push_turn_context(want_vars)
+                # A cell that named its own timeout runs under it; everything else
+                # runs under the kernel's default.
+                cell_limit = {"timeout": call.timeout} if call.timeout else {}
+                if call.timeout:
+                    # Not a warning -- asking for longer is the supported thing to
+                    # do -- but worth saying, so a cell that sits silent for ten
+                    # minutes reads as intended rather than hung.
+                    self._emit("note", message=f"cell timeout {call.timeout:g}s")
+                started = time.time()
+                output = self.kernel.execute(call.code, control_nonce=nonce, **cell_limit)
+                elapsed = time.time() - started
+                rendered = output.render()
+                if last and (dropped := self._strays(turn)):
+                    # The python calls still ran; say what was dropped so the model
+                    # stops reaching for a tool it does not have, without costing it
+                    # the cells it just wrote.
+                    rendered += (f"\n\n[also called {dropped} in this turn — ignored. "
+                                 f"{self._only_tools()}.]")
+                    self._emit("warning", message=f"ignored extra tool call(s): {dropped}")
+                if last and blank:
+                    # A call with empty arguments beside calls that carried code.
+                    # Nothing was lost -- there was nothing in it to run -- but the
+                    # model is owed the arithmetic, or it reads one output short and
+                    # cannot tell which of its calls the missing one was.
+                    rendered += (f"\n\n[{blank} further python call(s) in this turn "
+                                 f"arrived with no code, and ran nothing.]")
+                    self._emit("warning", message=(f"{blank} empty call(s) alongside "
+                                                   f"{len(runnable)} that ran"))
+                # A batch shares one assistant message, so its ids have to be
+                # distinct within it: a server that repeats one would otherwise
+                # send two tool_use blocks the results cannot be told apart by.
+                tool_use_id = call.tool_use_id or f"tu_{turn_no}_{i}"
+                if tool_use_id in seen_ids:
+                    tool_use_id = f"{tool_use_id}_{i}"
+                seen_ids.add(tool_use_id)
+                cell = self.store.add(
+                    code=call.code,
+                    output=rendered,
+                    tool_use_id=tool_use_id,
+                    # The prose and the thinking belong to the turn rather than to
+                    # any one of its calls, and the batch renders as a single
+                    # assistant message -- so they ride the first cell, and are
+                    # neither repeated nor attributed to a cell that came later.
+                    thought=turn.text if i == 0 else "",
+                    thinking_blocks=turn.thinking_blocks if i == 0 else [],
+                    turn=turn_no,
                 )
-                for event in events:
-                    self._emit("compaction", detail=str(event), requested=True)
+                # The status line is written after the cell exists so the accounting
+                # it quotes includes the cell it is attached to -- a footer that
+                # described the context as it was before this output would be wrong
+                # by exactly the amount the model is trying to track.
+                cell.output = rendered + "\n\n" + self._status_line(elapsed)
+                result.turns = len(self.store.cells)
+                self._emit("cell", n=cell.n, output=cell.output, ok=output.ok)
 
-            if signals.get("done"):
-                # The in-kernel finish, which only a subagent has: its result is
-                # an object in that kernel, so it crosses by value here.
-                result.value = self._pull_done(signals, result)
-                result.brief = signals.get("done_brief") or ""
-                return self._finish(result, finish="done", text=turn.text,
-                                    carried=carried, cell=cell)
+                payload = output.control
+                if payload is None or output.control_error:
+                    # No payload, or one that arrived unusable. Rare enough to pay a
+                    # probe for, and never worth proceeding on a half-read one.
+                    payload = self._fallback_payload(want_vars, output.control_error)
+                signals = self._apply_payload(payload, want_vars)
+
+                if request := signals.get("compress"):
+                    events = self.compressor.apply(
+                        self.store, self.kernel,
+                        mode=request.get("mode", "evict"), before=request.get("before"),
+                    )
+                    for event in events:
+                        self._emit("compaction", detail=str(event), requested=True)
+
+                if signals.get("done"):
+                    # The in-kernel finish, which only a subagent has: its result is
+                    # an object in that kernel, so it crosses by value here. The run
+                    # is over at the cell that called it, so whatever the turn
+                    # batched behind that cell is not run -- said out loud, because
+                    # code the model wrote and never saw execute is exactly the kind
+                    # of thing a reader assumes ran.
+                    if not last:
+                        self._emit("note", message=(
+                            f"done() ended the run; {len(runnable) - i - 1} later "
+                            f"call(s) in this turn were not run"))
+                    result.value = self._pull_done(signals, result)
+                    result.brief = signals.get("done_brief") or ""
+                    return self._finish(result, finish="done", text=turn.text,
+                                        carried=carried, cell=cell)
 
             if finishing:
                 # A `done` block beside a cell means "run this, then finish", and
@@ -510,13 +558,13 @@ class Runner:
     def _strays(self, turn) -> str:
         """Tool calls in this turn that ran nothing, as a printable list.
 
-        `done` never appears here: the provider extracts it before anything
-        competes for the acted-on slot, because it is the turn saying it is the
-        last one rather than a call that wanted running.
+        Every `python` block in the turn runs, so what is left is a tool that does
+        not exist. `done` never appears here either: the provider extracts it
+        before anything competes for a slot, because it is the turn saying it is
+        the last one rather than a call that wanted running.
         """
         names = list(turn.ignored_tools)
-        if turn.tool_name and turn.tool_name != "python":
-            names.append(turn.tool_name)
+        names += [c.name for c in turn.calls if c.name != "python"]
         return ", ".join(sorted(set(names)))
 
     def _push_turn_context(self, want_vars: bool) -> str | None:

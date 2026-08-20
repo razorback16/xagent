@@ -134,13 +134,24 @@ You have two tools. `python` takes one argument, `code`, and runs it in that ker
 `done` takes nothing and ends the run. Everything else -- reading a file, running a
 shell command, spawning a subagent -- is an ordinary Python function already defined
 in the kernel, called by writing Python. A tool call by any other name runs nothing
-and costs you the turn."""
+and costs you the turn.
+
+Several `python` calls may go out in one turn. They run in order in the same kernel,
+each returning its own output, so steps you already know you want -- three files to
+read, a build and the test after it -- cost one round trip rather than three. Keep a
+step whose code depends on what an earlier call printed for the next turn, where you
+can read that output before writing it."""
 
 _TOOLS_SUB = """\
 You have exactly one tool, `python`, and it takes one argument, `code`. Everything
 else -- reading a file, running a shell command, spawning a subagent, finishing --
 is an ordinary Python function already defined in that kernel, called by writing
-Python. A tool call by any other name runs nothing and costs you the turn."""
+Python. A tool call by any other name runs nothing and costs you the turn.
+
+Several `python` calls may go out in one turn. They run in order in the same kernel,
+each returning its own output, so steps you already know you want cost one round trip
+rather than several. Keep a step whose code depends on what an earlier call printed
+for the next turn, where you can read that output before writing it."""
 
 _FINISHING_TOP = """\
 # Finishing

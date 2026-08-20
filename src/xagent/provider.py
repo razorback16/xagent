@@ -35,6 +35,12 @@ _PYTHON_BODY = (
     f"will take longer -- a build, an install, a large download, a long batch -- "
     f"pass `timeout` with the seconds it needs (up to {MAX_CELL_TIMEOUT:g}) in the "
     f"same call, rather than letting it be cut off and retried.\n\n"
+    "You may make several `python` calls in one turn. They run in order in the "
+    "same kernel and each comes back with its own output, so independent steps -- "
+    "three files to read, a build and the test that follows it -- cost one round "
+    "trip instead of three. Batch what you already know you want to run; a step "
+    "whose code depends on what an earlier call printed belongs in the next turn, "
+    "where you can read that output first.\n\n"
 )
 
 _PYTHON_SCHEMA = {
@@ -157,6 +163,28 @@ def _cell_timeout(raw) -> float | None:
 
 
 @dataclass
+class Call:
+    """One tool_use block the turn wants acted on, in the shape the runner reads.
+
+    `name` is carried because a call that is not `python` still needs answering:
+    the runner replies to the block by id, telling the model the tool does not
+    exist, and a reply without an id would leave the tool_use unanswered.
+    """
+    name: str = "python"
+    code: str = ""
+    timeout: float | None = None
+    tool_use_id: str | None = None
+
+
+def _call(block) -> Call:
+    """One tool_use block from the wire, validated into a Call."""
+    args = block.input if isinstance(block.input, dict) else {}
+    return Call(name=block.name, tool_use_id=block.id,
+                code=args.get("code") or "",
+                timeout=_cell_timeout(args.get("timeout")))
+
+
+@dataclass
 class Turn:
     text: str = ""
     thinking: str = ""
@@ -168,17 +196,40 @@ class Turn:
     tool_use_id: str | None = None
     tool_name: str | None = None
     # The top-level finish. Set when a `done` tool block arrived; it is extracted
-    # rather than treated as a call to act on, so it never competes with `python`
-    # for the one acted-on slot and never lands in `ignored_tools`.
+    # rather than treated as a call to act on, so it never competes with the
+    # `python` calls beside it and never lands in `ignored_tools`.
     done: bool = False
     done_id: str | None = None
     # Names of any further tool_use blocks in the same turn that were not acted
     # on, so the caller can correct the model without discarding what it did.
     ignored_tools: list[str] = field(default_factory=list)
+    # Every call to act on, in the order the model wrote them. A turn usually
+    # holds one; a model trained for parallel tool use batches several, and they
+    # run in order in the one kernel. The scalar fields above describe the first
+    # of them, which is the whole turn whenever there is only one -- kept so that
+    # every reading of a single-call turn stays what it always was.
+    calls: list[Call] = field(default_factory=list)
     stop_reason: str = ""
     input_tokens: int = 0
     cache_read: int = 0
     cache_write: int = 0
+
+    def __post_init__(self) -> None:
+        # Built from the scalar fields alone: derive the list, so a caller that
+        # has only ever known one call per turn still hands the runner the one
+        # shape it reads.
+        if not self.calls and (self.tool_use_id or self.tool_name):
+            self.calls = [Call(name=self.tool_name or "python", code=self.code or "",
+                               timeout=self.timeout, tool_use_id=self.tool_use_id)]
+
+    def set_calls(self, calls: list[Call]) -> None:
+        """Record the calls and mirror the first onto the scalar view."""
+        self.calls = calls
+        first = calls[0] if calls else None
+        self.tool_name = first.name if first else None
+        self.tool_use_id = first.tool_use_id if first else None
+        self.code = first.code if first else None
+        self.timeout = first.timeout if first else None
 
 
 class Provider:
@@ -465,21 +516,22 @@ class Provider:
                 turn.done_id = finish.id
                 tool_blocks = [b for b in tool_blocks if b is not finish]
 
-        # A turn can carry more than one tool_use block -- qwen is trained with
-        # shell tools and reaches for one it was never given. Last-write-wins let
-        # that stray block overwrite a perfectly good `python` call, so the code
-        # was silently dropped and the turn was spent reporting the stray name.
-        # Act on the python call wherever it sits, and merely report the rest.
-        acted = next((b for b in tool_blocks if b.name == "python"), None)
-        if acted is None and tool_blocks:
-            acted = tool_blocks[0]
-        if acted is not None:
-            turn.tool_name = acted.name
-            turn.tool_use_id = acted.id
-            turn.code = (acted.input.get("code") or "") if isinstance(acted.input, dict) else ""
-            if isinstance(acted.input, dict):
-                turn.timeout = _cell_timeout(acted.input.get("timeout"))
-            turn.ignored_tools = [b.name for b in tool_blocks if b is not acted]
+        # Every `python` block in the turn is a call to run, wherever it sits.
+        # There is nothing a REPL has to do to support that: the cells run in
+        # order in the same kernel, exactly as they would across consecutive
+        # turns, and the turn costs one round trip instead of three. What is left
+        # over is a tool that does not exist -- qwen is trained with shell tools
+        # and reaches for one it was never given -- and it is reported rather than
+        # run. Only a turn with no `python` block at all promotes a stray to the
+        # acted-on call, so the correction the runner writes has a block to
+        # answer; a reply needs the id of a tool_use, and inventing one is not an
+        # option the API leaves open.
+        acted = [b for b in tool_blocks if b.name == "python"]
+        if not acted and tool_blocks:
+            acted = tool_blocks[:1]
+        chosen = {id(b) for b in acted}
+        turn.set_calls([_call(b) for b in acted])
+        turn.ignored_tools = [b.name for b in tool_blocks if id(b) not in chosen]
         return turn
 
     def complete(self, prompt: str, model: str | None = None, max_tokens: int = 4096) -> str:

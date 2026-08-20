@@ -29,7 +29,7 @@ import sys
 from xagent import config
 from xagent.cli import make_printer
 from xagent.prompts import SYSTEM
-from xagent.provider import Turn, Usage
+from xagent.provider import Call, Turn, Usage
 from xagent.runner import Runner, strip_trailing_done
 
 PASS, FAIL = [], []
@@ -421,6 +421,64 @@ def main() -> int:
     check("and the turn limit hands it no prose either",
           result.finish == "max_turns" and result.answer == "",
           f"{result.finish} {result.answer!r}")
+
+    print("\nparallel calls: one turn, several cells, run in order in the one kernel")
+    batch = Turn(text="", calls=[Call(code="p = 41", tool_use_id="tu_p1"),
+                                 Call(code="print(p + 1)", tool_use_id="tu_p2")])
+    result, provider, events = drive_recorded([batch, finish(ANSWER)])
+    check("every call ran, each with an output of its own",
+          len(cells(events)) == 2, f"{len(cells(events))} cell events")
+    check("in order, in the same namespace",
+          "42" in cells(events)[1]["output"], cells(events)[1]["output"][:120])
+    check("and nothing is reported as ignored, because nothing was",
+          "ignored" not in warnings(events), warnings(events))
+    check("the reader is told the turn batched rather than looping",
+          "2 calls in this turn" in notes(events), notes(events))
+    check("the run still finishes on the prose beside the finish",
+          result.answer == ANSWER, repr(result.answer[:80]))
+
+    both = Turn(text=ANSWER, calls=[Call(code="a = 1", tool_use_id="tu_b1"),
+                                    Call(code="b = 2", tool_use_id="tu_b2")],
+                done=True, done_id="tu_bd")
+    result, provider, events = drive_recorded([both, Turn(text="Unused.")])
+    check("a finish beside a batch runs the whole batch first",
+          len(cells(events)) == 2 and result.finish == "done",
+          f"{len(cells(events))} cells, finish={result.finish}")
+    check("and costs no extra request for the answer",
+          provider.asked.count(False) == 0, str(provider.asked))
+
+    stray = Turn(text="", calls=[Call(code="c = 1", tool_use_id="tu_s1"),
+                                 Call(code="d = 2", tool_use_id="tu_s2")],
+                 ignored_tools=["bash"])
+    _, _, events = drive_recorded([stray, finish(ANSWER)])
+    check("a stray tool beside a batch is reported once, on the last cell",
+          warnings(events).count("ignored extra tool call(s): bash") == 1,
+          warnings(events))
+    check("and not against a call that ran perfectly well",
+          "ignored" not in cells(events)[0]["output"], cells(events)[0]["output"][:120])
+
+    half = Turn(text="", calls=[Call(code="e = 1", tool_use_id="tu_h1"),
+                                Call(code="   ", tool_use_id="tu_h2")])
+    _, _, events = drive_recorded([half, finish(ANSWER)])
+    check("an empty call beside a real one costs the real one nothing",
+          len(cells(events)) == 1, f"{len(cells(events))} cell events")
+    check("and the model is told one of its calls carried no code",
+          "arrived with no code" in cells(events)[0]["output"],
+          cells(events)[0]["output"][:160])
+
+    stop = Turn(text="", calls=[Call(code="done({'n': 7})", tool_use_id="tu_d1"),
+                                Call(code="never = True", tool_use_id="tu_d2")])
+    result, _, events = drive_recorded([stop], is_subagent=True)
+    check("done() inside a batch ends the run at that call",
+          result.value == {"n": 7} and len(cells(events)) == 1,
+          f"value={result.value!r} cells={len(cells(events))}")
+    check("and the reader is told what the turn had queued behind it",
+          "were not run" in notes(events), notes(events))
+
+    out = rendered([("turn", {"n": 1, "text": "", "thinking": "",
+                              "code": "p = 41", "codes": ["p = 41", "print(p + 1)"]})])
+    check("a turn that did not stream prints every call it made, not just the first",
+          out.count("▸ python") == 2, repr(out))
 
     print(f"\n{'─' * 60}\n{len(PASS)} passed, {len(FAIL)} failed")
     for name in FAIL:

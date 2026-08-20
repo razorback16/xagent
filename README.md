@@ -134,6 +134,16 @@ ordinary function in the kernel namespace. The system prompt carries this listin
 with signatures, generated at import time by introspecting the live objects, so it
 cannot drift from the code; `helpers()` prints the same listing back in-kernel.
 
+**A turn may carry several `python` calls, and every one of them runs.** Models
+trained for parallel tool use batch independent steps — three files to read, a build
+and the test after it — and a REPL has nothing to do to accept that: the cells run in
+order in the same kernel, each returning its own output, exactly as they would across
+consecutive turns. The turn costs one round trip instead of three. They render back
+as one assistant message with one tool_use block per call, which is what the API
+requires; a step whose code depends on what an earlier call printed still belongs in
+the next turn, and the prompt says so. Only a tool that does not exist is refused,
+and it is reported rather than silently dropped.
+
 **Every cell output ends with a status line the model does not have to ask for.**
 
 ```

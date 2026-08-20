@@ -170,9 +170,14 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
                     print(c(f"  ┊ thought ~{approx:,} tok", "dim"))
             if data.get("text"):
                 print(indent(data["text"], "  ", 1200))
-            if data.get("code"):
+            # One header per call: a turn that batched three of them ran three
+            # cells, and printing only the first would credit the outputs below to
+            # code that is not on screen.
+            for code in (data.get("codes") or ([data["code"]] if data.get("code") else [])):
+                if not (code or "").strip():
+                    continue
                 print(c("  ▸ python", "cyan"))
-                print(textwrap.indent(data["code"].strip(), c("  │ ", "cyan")))
+                print(textwrap.indent(code.strip(), c("  │ ", "cyan")))
         elif kind == "answer_start":
             close_section()
             live["streamed"] = False
