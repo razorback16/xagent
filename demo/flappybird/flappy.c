@@ -1,6 +1,6 @@
-/* flappy.c -- Flappy Bird in C, OpenGL (freeglut) + SDL2_mixer + Freetype.
+/* flappy.c -- Flappy Bird in C, OpenGL (GLUT) + SDL2_mixer + Freetype.
  *
- * Build:  make            (or: gcc -O2 -o flappy flappy.c -lGL -lGLU -lglut -lSDL2 -lSDL2_mixer -lfreetype -lm)
+ * Build:  make            (freeglut + Mesa on Linux, GLUT.framework on macOS)
  * Run:    ./flappy
  *
  * Controls:
@@ -17,8 +17,12 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#if defined(__APPLE__) && !defined(FLAPPY_HEADLESS_TEST)
+#include <GLUT/glut.h>          /* Apple GLUT: a Cocoa window, no X11 server */
+#include <OpenGL/gl.h>
+#else
 #include <GL/glut.h>
-#include <GL/freeglut_ext.h>
+#endif
 #include <SDL.h>
 #include <SDL_mixer.h>
 #include <ft2build.h>
@@ -61,7 +65,22 @@ static int          paused = 0;
 static int          frameCount = 0;
 static int          dumpAt = 0;      /* FLAPPY_DUMP env: dump this frame and exit */
 static int          mouseX = W/2, mouseY = H/2, mouseDown = 0;
-static const char  *fontPath = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+static const char  *fontPath = 0;              /* set by --font, else autodetect */
+
+/* Font file candidates. FreeType opens .ttc collections at face index 0, which
+   is enough for our ASCII atlas. The order below tries macOS first, then
+   common Linux distributions, then Homebrew freetype's own bundled font. */
+static const char *fontCandidates[] = {
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Helvetica.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    0
+};
 
 /* Freetype + text atlas */
 static FT_Library  ft;
@@ -104,7 +123,8 @@ typedef struct {
 static Tone *toneNew(int n, int rate)
 {
     Tone *t = calloc(1, sizeof(Tone));
-    t->buf = malloc(sizeof(float) * n);
+    /* toneNote accumulates with +=, so the sample buffer must start at zero. */
+    t->buf = calloc(n, sizeof(float));
     t->n = n; t->rate = rate;
     return t;
 }
@@ -147,8 +167,14 @@ static unsigned char *toWav(Tone *t)
 }
 static Mix_Chunk *chunkFromTone(Tone *t)
 {
+    /* Mix_QuickLoad_WAV keeps a pointer into the caller's buffer and reads it
+       on every playback, so freeing the buffer here would leave the mixer
+       playing freed memory. Mix_LoadWAV_RW copies the samples and converts
+       to the mixer's output format, so the WAV buffer is safe to free. */
+    int sz = wavSize(t->n, t->rate);
     unsigned char *w = toWav(t);
-    Mix_Chunk *c = Mix_QuickLoad_WAV(w);
+    SDL_RWops *rw = SDL_RWFromMem(w, sz);
+    Mix_Chunk *c = Mix_LoadWAV_RW(rw, 1);
     free(w);
     return c;
 }
@@ -248,9 +274,23 @@ static void initText(void)
     int i;
     memset(atlasTex, 0, sizeof(atlasTex));
     if (FT_Init_FreeType(&ft) != 0) { ft = 0; return; }
-    if (FT_New_Face(ft, fontPath, 0, &face) != 0) {
-        fprintf(stderr, "font: cannot open %s, using built-in bitmap font\n", fontPath);
-        face = 0; return;
+    face = 0;
+    if (fontPath && FT_New_Face(ft, fontPath, 0, &face) == 0) {
+        /* explicit --font wins */
+    } else {
+        int fi;
+        for (fi = 0; fontCandidates[fi]; fi++) {
+            if (FT_New_Face(ft, fontCandidates[fi], 0, &face) == 0) {
+                fontPath = fontCandidates[fi];
+                break;
+            }
+            face = 0;
+        }
+    }
+    if (!face) {
+        fprintf(stderr, "font: no usable TTF found (tried --font and %d fallbacks); "
+                        "text disabled\n", (int)(sizeof fontCandidates / sizeof fontCandidates[0]) - 1);
+        return;
     }
     FT_Set_Pixel_Sizes(face, 0, 26);
     fontAscent = face->size->metrics.ascender / 64;
@@ -274,8 +314,14 @@ static void initText(void)
             rowMaxH = 0;
         }
         if (h > rowMaxH) rowMaxH = h;
-        /* record per-glyph metrics; advance = width + 2px side bearing */
-        charW[(unsigned char)chars[i]] = w + 2; /* +advance */
+        /* record per-glyph metrics. Use FreeType's advance (in 26.6 fixed
+           point) so glyphs with no bitmap - the space, mainly - still
+           advance the pen by the correct amount. */
+        {
+            int adv = (int)(face->glyph->advance.x >> 6);
+            if (adv <= 0) adv = w + 2;
+            charW[(unsigned char)chars[i]] = adv;
+        }
         glyphW[(unsigned char)chars[i]]  = w;
         glyphH[(unsigned char)chars[i]]  = h;
         glyphLeft[(unsigned char)chars[i]] = left;
@@ -950,8 +996,7 @@ static void keyboard(unsigned char k, int x, int y)
 {
     (void)x; (void)y;
     if (k == 27 || k == 'q' || k == 'Q') {
-        glutLeaveMainLoop();
-        return;
+        exit(0);          /* Apple GLUT has no glutLeaveMainLoop; atexit cleans up */
     }
     if (k == 'p' || k == 'P') {
         if (state == S_PLAY || state == S_READY) paused = !paused;
@@ -1007,11 +1052,11 @@ static void mouseMove(int x, int y)
 
 static void initGLut(void)
 {
-    glClearColor(0.45f, 0.75f, 0.95f, 1.f);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
     glutInitWindowSize(W, H);
     glutInitWindowPosition(200, 60);
     glutCreateWindow("Flappy Bird - C/OpenGL");
+    glClearColor(0.45f, 0.75f, 0.95f, 1.f);
     glutReshapeFunc(reshape);
     glutDisplayFunc(display);
     glutIdleFunc(idle);
@@ -1022,6 +1067,18 @@ static void initGLut(void)
 }
 
 #ifndef FLAPPY_HEADLESS_TEST
+static void freeResources(void)
+{
+    if (face) FT_Done_Face(face);
+    if (ft) FT_Done_FreeType(ft);
+    if (sfxFlap) Mix_FreeChunk(sfxFlap);
+    if (sfxScore) Mix_FreeChunk(sfxScore);
+    if (sfxHit) Mix_FreeChunk(sfxHit);
+    if (sfxDie) Mix_FreeChunk(sfxDie);
+    if (sfxSwoosh) Mix_FreeChunk(sfxSwoosh);
+    if (haveAudio) { Mix_CloseAudio(); SDL_Quit(); }
+}
+
 int main(int argc, char **argv)
 {
     int i;
@@ -1034,19 +1091,12 @@ int main(int argc, char **argv)
     if (getenv("FLAPPY_DUMP")) dumpAt = atoi(getenv("FLAPPY_DUMP"));
     loadBest();
     initAudio();
+    atexit(freeResources);      /* glutMainLoop never returns under Apple GLUT */
     glutInit(&argc, argv);
     initGLut();
     initText();
     resetGame();
     glutMainLoop();
-    if (face) FT_Done_Face(face);
-    if (ft) FT_Done_FreeType(ft);
-    if (sfxFlap) Mix_FreeChunk(sfxFlap);
-    if (sfxScore) Mix_FreeChunk(sfxScore);
-    if (sfxHit) Mix_FreeChunk(sfxHit);
-    if (sfxDie) Mix_FreeChunk(sfxDie);
-    if (sfxSwoosh) Mix_FreeChunk(sfxSwoosh);
-    if (haveAudio) { Mix_CloseAudio(); SDL_Quit(); }
     return 0;
 }
 #endif

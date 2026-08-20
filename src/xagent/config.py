@@ -117,7 +117,7 @@ BACKENDS: dict[str, Backend] = {
         base_url="https://api.codiv.ai",
         driver_model="qwen-3.8-27b",
         worker_model="qwen-3.8-27b",
-        context_budget=180_000,
+        context_budget=200_000,
         # qwen reasons at length before emitting a tool call, and a budget that is
         # too tight is spent entirely on thinking -- the turn then returns no action.
         max_output=128_000,

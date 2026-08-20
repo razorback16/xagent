@@ -1,4 +1,4 @@
-# Flappy Bird — C + OpenGL (freeglut)
+# Flappy Bird — C + OpenGL (GLUT)
 
 A complete Flappy Bird game written in portable C using the classic GLUT/OpenGL
 stack. All graphics are procedural (no image assets) and all sounds are
@@ -18,14 +18,20 @@ synthesized at startup as WAV data and fed to SDL_mixer (no audio assets).
 
 Dependencies (Ubuntu/Debian):
 
-    sudo apt install build-essential freeglut3-dev libgl1-mesa-dev libglu1-mesa-dev \
+    sudo apt install build-essential freeglut3-dev libgl1-mesa-dev \
                      libsdl2-dev libsdl2-mixer-dev libfreetype-dev
+
+Dependencies (macOS, Homebrew):
+
+    brew install sdl2 sdl2_mixer freetype pkg-config
 
 Then:
 
     make          # builds ./flappy
 
-The Makefile uses pkg-config to find freetype2, sdl2 and SDL2_mixer.
+The Makefile uses pkg-config to find freetype2, sdl2 and SDL2_mixer. On Linux
+it links freeglut and Mesa. On macOS it links `GLUT.framework` and
+`OpenGL.framework`, so the game needs no X11 server.
 
 ## Run
 
@@ -54,6 +60,9 @@ On the Game Over screen: SPACE or clicking "Play Again" restarts.
 EGL context into an FBO (no display needed) and checks the state machine:
 ready→play→death transitions, flapping physics, pipe spawning, scoring,
 collision, banner timing and restart.
+
+The test always renders through Mesa, never Apple OpenGL. On macOS it needs
+`brew install freeglut mesa`.
 
 ## Layout
 
