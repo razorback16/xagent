@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import pprint
 import sys
 import textwrap
 from pathlib import Path
 
 from xagent import config
 from xagent.provider import Provider
-from xagent.runner import Runner
+from xagent.runner import MAX_TURN_BLOCKS, MAX_TURNS, Runner
 
 C = {
     "dim": "\033[2m", "bold": "\033[1m", "reset": "\033[0m",
@@ -172,6 +173,22 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
             if data.get("code"):
                 print(c("  ▸ python", "cyan"))
                 print(textwrap.indent(data["code"].strip(), c("  │ ", "cyan")))
+        elif kind == "answer_start":
+            close_section()
+            live["streamed"] = False
+            live["think_chars"] = 0
+            if data.get("ask"):
+                # The `← output` printed above is not what the model read -- the
+                # fallback overwrote it on the way in, and a transcript that shows
+                # only the first version explains the answer by a prompt that was
+                # never sent. Show the replacement, not the cell a second time.
+                print(c("  ← output rewritten for the answer turn", "yellow"))
+                print(indent(data["ask"], c("  │ ", "yellow"), 2000))
+            print(c("\n─── answer", "dim"))
+        elif kind == "answer":
+            close_section()
+            if not live["streamed"] and data.get("text"):
+                print(indent(data["text"], "  ", 4000))
         elif kind == "cell":
             close_section()
             colour_name = "dim" if data["ok"] else "red"
@@ -181,6 +198,9 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
             close_section()
             tag = "requested" if data.get("requested") else "forced"
             print(c(f"\n✂ compaction ({tag}): {data['detail']}", "mag"))
+        elif kind == "note":
+            close_section()
+            print(c(f"  · {data['message']}", "dim"))
         elif kind == "warning":
             close_section()
             print(c(f"\n! {data['message']}", "yellow"))
@@ -199,12 +219,16 @@ def main(argv: list[str] | None = None) -> int:
                         choices=sorted(config.BACKENDS), help="which backend to use")
     parser.add_argument("-m", "--model", default=None, help="override the driver model")
     parser.add_argument("-t", "--thinking", default=None, choices=config.THINKING_CHOICES,
-                        help=f"extended thinking level (default {config.DEFAULT_THINKING}; "
-                             f"`off` disables)")
+                        help=f"thinking depth (default {config.DEFAULT_THINKING}; "
+                             f"`off` disables). On current Claude models this is the "
+                             f"effort level the model paces its own thinking against; "
+                             f"on qwen it maps to a token budget")
     parser.add_argument("-s", "--sampling", default=None, choices=sorted(config.SAMPLING),
                         help="sampling preset (qwen only; the Anthropic API rejects these)")
     parser.add_argument("-C", "--cwd", default=None, help="working directory for the kernel")
-    parser.add_argument("-n", "--max-turns", type=int, default=40)
+    parser.add_argument("-n", "--max-turns", type=int, default=MAX_TURNS,
+                        help="turns per block; reaching it compacts and grants "
+                             f"another, up to {MAX_TURN_BLOCKS} blocks")
     parser.add_argument("-b", "--budget", type=int, default=None,
                         help="context budget in tokens before compaction is forced")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -252,8 +276,13 @@ def main(argv: list[str] | None = None) -> int:
         print(c(f"✓ {result.finish}", "green"))
     if result.degraded:
         print(c("  (value could not be serialized — shown as a rendering)", "yellow"))
-    if result.value is not None:
-        rendered = result.value if isinstance(result.value, str) else repr(result.value)
+    # The answer has already been on screen: it streamed as it was written, under
+    # its own header. Reprinting it here would show the deliverable twice. What is
+    # left to print is a value passed to done() by a run that produced no prose --
+    # a subagent-shaped finish at the top level, or an answer turn that failed.
+    if not result.answer and result.value is not None:
+        rendered = (result.value if isinstance(result.value, str)
+                    else pprint.pformat(result.value, width=88))
         print("\n" + textwrap.indent(rendered.strip()[:4000], "  "))
 
     usage = result.usage

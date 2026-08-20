@@ -8,8 +8,11 @@ Run with:  uv run python tests/test_sampling.py
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
-from xagent import config
+import httpx
+
+from xagent import config, provider as provider_mod
 from xagent.provider import Provider
 
 PASS, FAIL = [], []
@@ -45,6 +48,32 @@ class _Stop(Exception):
     pass
 
 
+class _FakeStream:
+    """One streamed response: relays a few events, then dies or completes."""
+
+    def __init__(self, events, boom):
+        self.events, self.boom = events, boom
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        yield from self.events
+        if self.boom is not None:
+            raise self.boom
+
+    def get_final_message(self):
+        return "final"
+
+
+def _events(code: str):
+    return [SimpleNamespace(type="text", text="thinking out loud"),
+            SimpleNamespace(type="input_json", snapshot={"code": code})]
+
+
 def main() -> int:
     print("qwen sampling presets reach the request")
     thinking = capture(backend="codiv", sampling="thinking")
@@ -78,28 +107,33 @@ def main() -> int:
     et = capture(backend="codiv", thinking="high", sampling="thinking")
     # SGLang accepts both together (verified: 200 on thinking + top_p/top_k), and it
     # is the only backend that is sent sampling at all -- so thinking being on by
-    # default must not cost qwen its recommended preset.
+    # default must not cost it its preset.
     check("temperature survives thinking", et.get("temperature") == 1.0, str(et.get("temperature")))
     check("top_p survives thinking", et.get("top_p") == 0.95)
     check("top_k survives thinking", et.get("top_k") == 20)
-    check("thinking block sent", et.get("thinking", {}).get("type") == "enabled")
-    check("budget_tokens is the 'high' budget",
-          et["thinking"]["budget_tokens"] == config.THINKING_BUDGETS["high"],
-          str(et.get("thinking")))
-    check("budget_tokens stays under max_tokens",
-          et["thinking"]["budget_tokens"] < et["max_tokens"])
-    check("extra_body survives alongside thinking", bool(et.get("extra_body")))
+    check("thinking block sent", et.get("thinking", {}).get("type") == "adaptive")
+    check("carrying the level as effort",
+          (et.get("output_config") or {}).get("effort") == "high",
+          str(et.get("output_config")))
+    check("extra_body survives alongside thinking",
+          (et.get("extra_body") or {}).get("min_p") == 0.0)
 
     print("\nthinking is on by default, and `off` is the only way out")
-    for backend in ("anthropic", "codiv"):
+    # Each backend states the same two things in its own shape: an unspecified
+    # level is the default level, and `off` really means none.
+    for backend, level_of, off_is in (
+        ("anthropic", lambda kw: (kw.get("output_config") or {}).get("effort"),
+         lambda kw: kw.get("thinking") == {"type": "disabled"}),
+        ("codiv", lambda kw: (kw.get("output_config") or {}).get("effort"),
+         lambda kw: kw.get("thinking") == {"type": "disabled"}),
+    ):
         default = capture(backend=backend)
         check(f"{backend}: unspecified → the default level",
-              default.get("thinking", {}).get("budget_tokens")
-              == config.THINKING_BUDGETS[config.DEFAULT_THINKING],
-              str(default.get("thinking")))
-        check(f"{backend}: `off` sends no thinking block",
-              "thinking" not in capture(backend=backend, thinking="off"),
-              str(capture(backend=backend, thinking="off").get("thinking")))
+              level_of(default) == config.DEFAULT_THINKING,
+              f"{default.get('thinking')} {default.get('output_config')}")
+        off = capture(backend=backend, thinking="off")
+        check(f"{backend}: `off` asks for no thinking", off_is(off),
+              str(off.get("thinking")))
     check("default level is medium", config.DEFAULT_THINKING == "medium")
     check("`off` resolves to no level", config.resolve_thinking("off") is None)
     check("unspecified resolves to the default",
@@ -136,6 +170,92 @@ def main() -> int:
           p_an._clamp(128_000, "s", [{"role": "user", "content": "x" * 800_000}]) == 128_000)
     check("clamp never exceeds the backend ceiling",
           p_codiv._clamp(999_999, "s", [{"role": "user", "content": "hi"}]) == 128_000)
+
+    print("\nthinking depth: a token budget is silently ignored by the current")
+    print("        models, so every level ran at the server default")
+    from typing import get_args, get_type_hints
+    from anthropic.types.output_config_param import OutputConfigParam
+
+    allowed = set(get_args(get_args(get_type_hints(OutputConfigParam)["effort"])[0]))
+    check("every level we offer is an effort level the SDK accepts",
+          set(config.THINKING_LEVELS) <= allowed,
+          f"{set(config.THINKING_LEVELS) - allowed} unknown to the SDK")
+    for level in config.THINKING_LEVELS:
+        kw = capture(backend="anthropic", thinking=level)
+        ok = (kw.get("thinking", {}).get("type") == "adaptive"
+              and (kw.get("output_config") or {}).get("effort") == level)
+        check(f"anthropic/{level}: adaptive, with effort carrying the level", ok,
+              f"thinking={kw.get('thinking')} output_config={kw.get('output_config')}")
+        check(f"anthropic/{level}: no budget_tokens, which these models dropped",
+              "budget_tokens" not in kw.get("thinking", {}), str(kw.get("thinking")))
+    check("thinking is streamed back readably, not omitted",
+          capture(backend="anthropic")["thinking"].get("display") == "summarized")
+    off = capture(backend="anthropic", thinking="off")
+    check("`off` is said out loud, because these models think by default",
+          off.get("thinking") == {"type": "disabled"}, str(off.get("thinking")))
+    check("and carries no effort, which a disabled turn may not pair with",
+          off.get("output_config") is None, str(off.get("output_config")))
+    # qwen takes the same shape: SGLang maps output_config.effort onto
+    # reasoning_effort, and logs-and-drops budget_tokens as unenforceable.
+    for level in config.THINKING_LEVELS:
+        kw = capture(backend="codiv", thinking=level)
+        check(f"codiv/{level}: the same effort shape, which SGLang does read",
+              kw.get("thinking", {}).get("type") == "adaptive"
+              and (kw.get("output_config") or {}).get("effort") == level,
+              f"thinking={kw.get('thinking')} output_config={kw.get('output_config')}")
+    check("no backend is sent a budget it would silently drop",
+          not any("budget_tokens" in str(capture(backend=b, thinking=lv).get("thinking"))
+                  for b in ("anthropic", "codiv") for lv in config.THINKING_LEVELS))
+
+    print("\na stream that dies while being read: the SDK wraps what happens")
+    print("        sending a request, not what happens reading one back")
+    p = Provider(backend="codiv")
+    relayed, attempts = [], []
+    p.on_delta = lambda part, text: relayed.append((part, text))
+    booms = [httpx.RemoteProtocolError("peer closed connection without sending "
+                                       "complete message body"), None]
+
+    def fake_stream(**kw):
+        boom = booms[len(attempts)]
+        attempts.append(kw)
+        return _FakeStream(_events("x = 1"), boom)
+
+    p.client = SimpleNamespace(messages=SimpleNamespace(stream=fake_stream))
+    slept, provider_mod.time.sleep = [], lambda s: slept.append(s)
+    try:
+        got = p._create(model="m", max_tokens=10, system=[], messages=[])
+    finally:
+        provider_mod.time.sleep = __import__("time").sleep
+    check("an incomplete chunked read is retried, not raised", got == "final",
+          repr(got))
+    check("and the second attempt reissues the same request", len(attempts) == 2,
+          str(len(attempts)))
+    check("the operator is told, so a retry does not look like a hang",
+          any(part == "retry" for part, _ in relayed), repr(relayed))
+    check("it waited before reissuing", slept == [2.0], str(slept))
+    code = "".join(text for part, text in relayed if part == "code")
+    check("the retried turn relays its code in full, not diffed against the "
+          "dead attempt's", code == "x = 1x = 1", repr(code))
+
+    p2 = Provider(backend="codiv")
+    dead = [httpx.RemoteProtocolError("closed") for _ in range(5)]
+    tries = []
+
+    def always_fail(**kw):
+        tries.append(kw)
+        return _FakeStream([], dead[len(tries) - 1])
+
+    p2.client = SimpleNamespace(messages=SimpleNamespace(stream=always_fail))
+    provider_mod.time.sleep = lambda s: None
+    try:
+        p2._create(model="m", max_tokens=10, system=[], messages=[])
+        check("a stream that never comes back is raised, not retried forever",
+              False, "returned instead of raising")
+    except httpx.RemoteProtocolError:
+        check("a stream that never comes back is raised, not retried forever",
+              len(tries) == 5, f"{len(tries)} attempts")
+    finally:
+        provider_mod.time.sleep = __import__("time").sleep
 
     print(f"\n{'─' * 60}\n{len(PASS)} passed, {len(FAIL)} failed")
     for name in FAIL:

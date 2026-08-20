@@ -113,16 +113,52 @@ thinking fixes the sampling distribution and the API rejects them alongside it.
 ```python
 read(path, lines=None)     write(path, text)      edit(path, old, new)
 ls(path, depth=1)          files(glob, path=".")  grep(pattern, glob="*")
-sh(cmd, timeout=120)       peek(x, n=40)
+sh(cmd, timeout=120)       peek(x, n=40)          helpers()
 
 ctx()                      # live token budget and the heaviest cells
 note(key, text)            # pin a fact; survives every compaction
-compress(mode="evict")     # compact now
+compress()                 # queue a compaction, applied after this cell
 
 agent(prompt, seed=…)      # subagent: own kernel, own context window
 gather(handles)            # blocks, preserves input order
-done(value)                # finish; value returns to the caller
+done(value)                # in a subagent: plain data back to the parent
 ```
+
+There are two *tools*, and only for the top-level agent: `python(code, timeout=180)`,
+and `done` — which takes no arguments and ends the run. A cell is interrupted after
+180 seconds and the namespace survives it, but a step the model already knows is slow
+— a build, an install, a long batch — says so in the call rather than discovering the
+wall by hitting it: `timeout` is an optional argument on every `python` call, clamped
+at an hour. Everything above is an
+ordinary function in the kernel namespace. The system prompt carries this listing
+with signatures, generated at import time by introspecting the live objects, so it
+cannot drift from the code; `helpers()` prints the same listing back in-kernel.
+
+**Every cell output ends with a status line the model does not have to ask for.**
+
+```
+[14:32:07 · cell 4.2s · run 6m12s · ctx 38,120/180,000 (21% +2,140)]
+```
+
+Time of day, how long the cell took, how long the run has been going, and what the
+context now costs against its budget with the change since the previous cell. It is
+~30 tokens a turn against the whole cell a `ctx()` call used to cost, and it turns
+context pressure into a trend the model watches rather than a number it samples,
+usually too late. `ctx()` remains, for the breakdown — heaviest cells, cache — when
+the totals are not the question.
+
+**Finishing is asymmetric, because the two callers are.** A person is waiting for
+the top-level agent, and its answer is prose it must generate either way — so it
+writes the answer as ordinary text and calls the argument-free `done` tool beside
+it. Models are trained to end runs with a tool call, and giving them a legal way to
+do it deletes a whole class of corrections that used to cost a turn each.
+
+A subagent is answering a program, and its result is an object in its kernel —
+often one it never saw whole, because the display is capped. It keeps the in-kernel
+`done(value)`: it hands back a *name*, cloudpickle moves the real object, and the
+cost is ~10 output tokens no matter how large the value. A tool argument would be
+JSON the model has to type out, which for a value it only saw a `<list len=1,847>`
+handle of means fabricating it. That is why subagents are offered no `done` tool.
 
 ## Compaction
 
@@ -151,22 +187,104 @@ slower and more expensive than doing nothing. So:
 Measured on the Anthropic backend: **79% cache hit rate** over a 9-turn session
 (19,328 cached reads against 1,629 fresh input tokens).
 
+## Two costs that were paid every turn
+
+**Kernel round-trips.** A turn used to pay two blocking probes beyond the cell
+itself — one before sampling for the accounting, ledger and variable table, one
+after execution to drain control signals. Both are gone. The harness now *pushes*
+the accounting in with a fire-and-forget silent execute just before the cell (silent
+executes skip IPython's cell hooks, so it disturbs nothing), and a `post_run_cell`
+hook appends the whole payload — signals, ledger, table — to the cell's own stdout,
+fenced between nonce-carrying markers that the kernel wrapper strips back out before
+the model ever sees them. A five-cell run now makes **zero** probes where it used to
+make ten. A truncated or absent payload falls back to the old probe rather than
+being half-read; the nonce is fresh per cell, so model code printing a lookalike
+cannot be mistaken for the harness talking to itself.
+
+**Subagent startup.** `agent()` used to pay a full kernel start — process spawn,
+channel setup, wait-for-ready, bootstrap — and a fan-out of thirty paid it thirty
+times, serially, inside the parent's cell timeout. A small pool now keeps kernels
+started but role-less; `acquire()` finishes one by injecting the per-run environment
+and *then* bootstrapping, which is the order that matters because `runtime.install()`
+reads `XAGENT_SEED` at bootstrap. Measured locally: **0.01s warm against 0.52s
+cold**. Three things stop a warm kernel outliving its parent — the pool's `atexit`,
+a graceful-first `shutdown()` that lets that `atexit` run, and `PDEATHSIG` on the
+kernel itself for when the process is killed outright. `XAGENT_KERNEL_POOL=0`
+disables it.
+
 ## Tests
 
 ```bash
-uv run python tests/test_mechanics.py     # 44 checks, no API calls
-uv run python tests/test_sampling.py      # 32 checks, no API calls
-uv run python tests/test_compaction.py    # 23 checks, needs a provider
-uv run python tests/test_regressions.py   # 31 checks, pins reviewed defects
+uv run python tests/run_all.py --offline   # everything below except compaction
+uv run python tests/test_mechanics.py      # 59 checks, no API calls
+uv run python tests/test_sampling.py       # 66 checks, no API calls
+uv run python tests/test_finishing.py      # 91 checks, no API calls
+uv run python tests/test_pool.py           # 24 checks, no API calls
+uv run python tests/test_regressions.py    # 168 checks, pins reviewed defects
+uv run python tests/test_compaction.py     # 23 checks, needs a provider
 ```
 
 `test_regressions.py` exists because a five-way code review found real defects; each
 check names the bug it prevents from returning. `test_mechanics.py` covers the layer
 below the model: state persistence, display
 capping, stdout head+tail elision, the harness-side backstop, timeout and interrupt
-recovery, the tool surface, off-transcript control signals, the variable table, and
-crossing the process boundary. `test_compaction.py` drives tier-3 eviction with a
-real kernel and a real model, and asserts the needle stays recoverable.
+recovery, the tool surface, the turn payload, the variable table, and crossing the
+process boundary. `test_finishing.py` drives the finishing contract end to end
+against a scripted provider and a real kernel. `test_pool.py` checks that an adopted
+kernel is indistinguishable from a cold one and that none outlives its parent.
+`test_compaction.py` drives tier-3 eviction with a real kernel and a real model, and
+asserts the needle stays recoverable.
+
+## Thinking depth is an effort level, not a token budget
+
+`-t low|medium|high|xhigh|max` (default `medium`, `off` to disable). On current
+Claude models that becomes `thinking: {type: "adaptive"}` plus
+`output_config: {effort: …}` — the model decides how much to think and paces itself
+against the level. The older `budget_tokens` ceiling is gone from those models, and
+the failure is silent rather than loud: measured against `claude-opus-5`, a request
+carrying `budget_tokens` came back with **no thinking at all** and ran at the server
+default, which is why every level used to behave identically. `display:
+"summarized"` is set explicitly too — the default is `omitted`, which would stream
+thinking blocks with empty text and show a long silence instead of the reasoning.
+
+qwen on SGLang takes the same field, which is why there is only one code path.
+SGLang's Anthropic endpoint maps `output_config.effort` onto its `reasoning_effort`
+knob and states in code that `budget_tokens` is *"accepted for SDK compatibility but
+the local backend has no equivalent hard-cap knob — the budget is not enforced"*: it
+logs it and drops it. So that route was inert at both ends.
+
+Effort is not a cap on qwen, it is an instruction the chat template writes into the
+prompt, and the template folds `high` and `max` into `xhigh` — three distinct
+behaviours, not five. Measured on the live server, three samples of one hard prompt:
+
+| effort | thinking tokens (median) |
+|---|---|
+| `low` | ~1,040 |
+| `medium` | ~894 — medium inserts no instruction at all |
+| `high` / `xhigh` / `max` | ~6,401 |
+
+`xhigh` is also what that template defaults to when no effort arrives, so every run
+before this change was thinking about 6× more than `-t medium` asked for.
+
+`off` is sent as `{type: "disabled"}` rather than by omitting the field: both
+backends think by default, so omission means *most* thinking, not none.
+
+## Running out of turns is a compaction, not an ending
+
+`--max-turns` (256 by default; 128 inside a subagent) is a block size, not a wall.
+Reaching it folds or evicts — the same policy the token budget triggers — and grants
+another block, because a run that spends its turns is usually a long job carrying a
+long context rather than a model that has lost the plot, and ending it there threw
+away every cell and every namespace it had built. `MAX_TURN_BLOCKS = 4` is the
+backstop that still stops a run going nowhere; only that ceiling ends a run as
+`max_turns`, and the prose it last wrote comes out as a partial answer.
+
+A run that dies on the wire is salvaged the same way: the turns, the cells and the
+last paragraph survive into the result rather than being replaced by an empty one.
+That matters most for the failure that motivated it — `RemoteProtocolError` from a
+local inference server dropping a decode, which the Anthropic SDK does not wrap
+because it happens while the stream is being *read*, not sent. It is retried now,
+five attempts on the same deadline-bounded backoff as a 429.
 
 ## Known sharp edges
 
@@ -195,8 +313,9 @@ real kernel and a real model, and asserts the needle stays recoverable.
   never folded and a generated file body is emitted as a literal. Measure that one
   first. (M5 in the plan.)
 - **Fan-out is untested at scale.** A `gather()` over many subagents can outlive the
-  180s cell timeout; the handles survive an interrupt and can be re-gathered, but
-  nothing yet proves the O(1)-context claim at 30 agents.
+  default 180s cell timeout — pass a larger `timeout` on that call — and the handles
+  survive an interrupt and can be re-gathered, but nothing yet proves the
+  O(1)-context claim at 30 agents.
 
 ## Layout
 
@@ -204,7 +323,8 @@ real kernel and a real model, and asserts the needle stays recoverable.
 src/xagent/
   brief.py     capping reprs + budgeted stdout   — runs inside the kernel
   runtime.py   the model-facing surface           — runs inside the kernel
-  kernel.py    jupyter_client wrapper, one per agent
+  kernel.py    jupyter_client wrapper, one per agent; strips the turn payload
+  pool.py      warm kernels, so spawning a subagent does not wait for one
   context.py   cells -> messages, cache breakpoints
   compress.py  fold / evict / variable table
   provider.py  Anthropic-compatible adapter, both backends

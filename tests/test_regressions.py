@@ -5,18 +5,25 @@ Run with:  uv run python tests/test_regressions.py
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import json
+import keyword
 import os
 import re
 import sys
+import textwrap
 from pathlib import Path
 
-from xagent import config
+from xagent import config, runtime, spawn
 from xagent.compress import Compressor
 from xagent.context import MAX_CODE_CHARS, ContextStore
-from xagent.kernel import Kernel
-from xagent.prompts import SYSTEM
-from xagent.provider import Provider, Usage
+from xagent.kernel import Kernel, _ControlSplitter
+from xagent.runtime import CTL_BEGIN, CTL_END
+from xagent.prompts import SUBAGENT_CODA, SYSTEM, SYSTEM_SUBAGENT
+from xagent.provider import (DONE_TOOL, PYTHON_TOOL, PYTHON_TOOL_SUBAGENT,
+                             Provider, Usage)
+from xagent.runner import DONE_EXPR, RunResult, Runner
 
 PASS, FAIL = [], []
 
@@ -29,6 +36,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 def main() -> int:
     k = Kernel()
+    # The in-kernel done() is the subagent's finish and only signals for that
+    # role, so everything about the value channel is exercised in a kernel that
+    # really has the role. `k` stays top-level, where done() is a redirect.
+    sub = Kernel(env={**os.environ, "XAGENT_ROLE": "subagent"})
     try:
         print("handles: _N named a slot one ahead of the real one, so every")
         print("         advertised handle was a NameError")
@@ -51,24 +62,73 @@ def main() -> int:
               table[:160])
 
         print("\ncontrol channel: the budgeted stream corrupted JSON and pickles")
-        k.execute("note('big', 'X' * 8000)")
-        k.execute("done({'answer': 42, 'blob': 'B' * 50000})")
-        signals = json.loads(k.probe("import xagent.runtime as _r; _r._emit_signals()"))
+        sub.execute("note('big', 'X' * 8000)")
+        sub.execute("done({'answer': 42, 'blob': 'B' * 50000})")
+        signals = json.loads(sub.probe("import xagent.runtime as _r; _r._emit_signals()"))
         check("a large note leaves signals parseable", signals["done"] is True)
         check("the note survives whole", len(signals["notes"]["big"]) == 8000,
               str(len(signals["notes"]["big"])))
-        from xagent.runner import DONE_EXPR
-
-        value = k.probe_pickle(DONE_EXPR)
+        value = sub.probe_pickle(DONE_EXPR)
         check("a large done() value crosses intact",
               value["answer"] == 42 and len(value["blob"]) == 50000)
         check("shadowing print does not break the control channel",
-              (k.execute("print = lambda *a, **kw: None"),
-               json.loads(k.probe("import xagent.runtime as _r; _r._emit_signals()"))["done"])[1])
-        k.execute("del print")
+              (sub.execute("print = lambda *a, **kw: None"),
+               json.loads(sub.probe("import xagent.runtime as _r; _r._emit_signals()"))["done"])[1])
+        sub.execute("del print")
+
+        print("\ncontrol payload: a truncated one must be refused, never half-read")
+        NONCE = "c0ffee"
+        good = json.dumps({"v": 1, "signals": {"done": False}})
+
+        def split(chunks, nonce=NONCE):
+            sp = _ControlSplitter(nonce)
+            seen = "".join(sp.feed(c) for c in chunks)
+            seen += sp.finish()
+            return seen, sp.result()
+
+        body = CTL_BEGIN.format(NONCE) + good + CTL_END.format(NONCE)
+        seen, (payload, err) = split(["out ", body, " more"])
+        check("a complete payload is lifted out of the stream",
+              payload == json.loads(good) and err is None, f"{payload} {err}")
+        check("and the model's own output survives it intact", seen == "out  more",
+              repr(seen))
+        # The markers can land split across two stream messages.
+        seen, (payload, err) = split([("out " + body)[:12], ("out " + body)[12:]])
+        check("a marker split across chunks is still recognised",
+              payload == json.loads(good) and seen == "out ", f"{payload} {seen!r}")
+        seen, (payload, err) = split(["x", CTL_BEGIN.format(NONCE), good[:20]])
+        check("a payload cut off mid-flight is refused, not half-read",
+              payload is None and "truncated" in (err or ""), f"{payload} {err}")
+        check("and its fragment never reaches the model's output", seen == "x", repr(seen))
+        seen, (payload, err) = split([CTL_BEGIN.format("other") + good
+                                      + CTL_END.format("other")])
+        check("a payload under another nonce is left alone as output",
+              payload is None and good in seen, f"{payload} {seen[:60]!r}")
+        stale = CTL_BEGIN.format(NONCE) + json.dumps({"v": 1, "files": "OLD"}) \
+            + CTL_END.format(NONCE)
+        seen, (payload, err) = split([stale, body])
+        check("when two arrive, the one the hook wrote last wins",
+              payload == json.loads(good), str(payload))
+        seen, (payload, err) = split([CTL_BEGIN.format(NONCE) + "{not json"
+                                      + CTL_END.format(NONCE)])
+        check("an unparseable payload is an error, not an empty dict",
+              payload is None and "unparseable" in (err or ""), f"{payload} {err}")
+
+        print("\ncontrol payload: a failed one must not overwrite what it could not read")
+        runner = Runner.__new__(Runner)
+        runner.store = ContextStore(task="t", system="s")
+        runner.store.live_vars = "  findings  list  len=160"
+        runner.store.live_files = "  created  a.py"
+        runner.compressor = Compressor(provider=None, budget=1000)
+        signals = runner._apply_payload({}, want_vars=True)
+        check("an empty payload leaves the last known variables standing",
+              runner.store.live_vars == "  findings  list  len=160", runner.store.live_vars)
+        check("and the last known file ledger too",
+              runner.store.live_files == "  created  a.py", runner.store.live_files)
+        check("with no signals invented for it", signals == {}, str(signals))
 
         print("\nsecurity: a subagent return value is not an execution vector")
-        k.execute(
+        sub.execute(
             "class Evil:\n"
             "    def __reduce__(self):\n"
             "        return (__import__('os').system, ('touch /tmp/claude-1000/XAGENT_PWNED',))\n"
@@ -76,12 +136,12 @@ def main() -> int:
         )
         refused = False
         try:
-            k.probe_pickle(DONE_EXPR)
+            sub.probe_pickle(DONE_EXPR)
         except Exception:
             refused = True
         check("malicious __reduce__ is refused", refused)
         check("its payload never ran", not os.path.exists("/tmp/claude-1000/XAGENT_PWNED"))
-        check("plain data still crosses", k.probe_pickle("{'a': [1, 2], 'b': 'x'}") == {"a": [1, 2], "b": "x"})
+        check("plain data still crosses", sub.probe_pickle("{'a': [1, 2], 'b': 'x'}") == {"a": [1, 2], "b": "x"})
 
         print("\nsecurity: credentials are out of reach")
         check("reading a .env is refused", "PermissionError" in k.execute("read('.env')").render())
@@ -163,6 +223,11 @@ def main() -> int:
         ledger = k.probe("import xagent.runtime as _r; _r._emit_file_ledger()")
         check("every written file is listed",
               "a.py" in ledger and "b.py" in ledger, ledger)
+        # The ledger the runner actually reads now rides the cell, not a probe.
+        k.push("import xagent.runtime as _r; _r._arm_turn({}, False, 'led1')")
+        carried = (k.execute("1", control_nonce="led1").control or {}).get("files", "")
+        check("and the same ledger rides the turn payload",
+              "a.py" in carried and "b.py" in carried, carried[:200])
         check("creation is distinguished from modification", "created" in ledger, ledger)
         check("repeat writes are counted", "2 writes" in ledger, ledger)
         check("the ledger is queryable from code",
@@ -190,7 +255,9 @@ def main() -> int:
         class _Block:
             def __init__(self, name, ident, code):
                 self.type, self.name, self.id = "tool_use", name, ident
-                self.input = {"code": code}
+                # The finish carries no input at all, which is what lets it be a
+                # tool in the first place.
+                self.input = {} if code is None else {"code": code}
 
         class _Usage:
             input_tokens = 1
@@ -204,17 +271,22 @@ def main() -> int:
             def __init__(self, blocks):
                 self.content = blocks
 
-        def assemble(blocks):
+        def _prov(offer_done=True):
             prov = Provider.__new__(Provider)
             prov.usage = Usage()
             prov.calls = 0
             prov.on_delta = None
             prov._code_seen = ""
-            prov._create = lambda **kw: _Resp(blocks)
             prov.backend = config.BACKENDS["codiv"]
             prov.model = "m"
             prov.thinking = None
             prov.sampling = "thinking"
+            prov.offer_done = offer_done
+            return prov
+
+        def assemble(blocks, offer_done=True):
+            prov = _prov(offer_done)
+            prov._create = lambda **kw: _Resp(blocks)
             return prov._sample_once("sys", [], 1024)
 
         py, sh = _Block("python", "tu_py", "x = 1"), _Block("sh", "tu_sh", "ls")
@@ -233,26 +305,233 @@ def main() -> int:
         check("a lone unknown tool is still surfaced for correction",
               turn.tool_name == "sh" and not turn.ignored_tools, str(turn.tool_name))
 
-        print("\nsystem prompt: `sh`/`done` were listed under a heading calling them")
-        print("               \"tools\", and the model duly emitted them as tool calls")
-        check("names `python` as the one tool that exists",
-              "only tool that exists" in SYSTEM and "`python`" in SYSTEM)
-        check("says plainly they are Python functions, not tools",
-              "not a tool" in SYSTEM)
-        check("no heading offers them as tools",
-              "Tools available" not in SYSTEM, "heading still calls them tools")
-        for name in ("sh", "done", "bash"):
-            check(f"warns that a {name!r} tool call is rejected", name in SYSTEM.split(
-                "# How a cell runs")[0])
+        print("\nprompt: the tool contract belongs in the tool description, which")
+        print("        the chat template renders inside the <tools> block")
+        DESC = PYTHON_TOOL["description"]
+        SUB_DESC = PYTHON_TOOL_SUBAGENT["description"]
+        check("the description names the two tools the top level has",
+              "This and `done` are the only tools that exist" in DESC, DESC[:200])
+        check("the subagent's names `python` as its only one",
+              "only tool that exists" in SUB_DESC, SUB_DESC[:200])
+        check("it says the helpers are functions, not tools", "not tools" in DESC)
+        check("it warns that any other tool name wastes the turn",
+              "other than `python` or `done` runs nothing" in DESC)
+        check("and the subagent's warns about anything but python",
+              "other than `python` runs nothing" in SUB_DESC)
+        check("the finish tool takes no input at all",
+              DONE_TOOL["input_schema"]["properties"] == {}
+              and not DONE_TOOL["input_schema"].get("required"),
+              str(DONE_TOOL["input_schema"]))
+        check("and says where the answer actually goes",
+              "the text is the answer" in DONE_TOOL["description"],
+              DONE_TOOL["description"][:200])
+        check("it says a cell in the same turn runs first",
+              "runs first" in DONE_TOOL["description"], DONE_TOOL["description"])
+        check("the prompt does not restate the contract at length",
+              "How a cell runs" not in SYSTEM)
+        check("no heading offers the helpers as tools", "Tools available" not in SYSTEM)
 
-        print("\n               an unescaped \\n in the docstring split the code example")
-        print("               that teaches how to write large files")
-        check("no raw newline inside a string-literal example",
-              '"\n".join' not in SYSTEM, "a code example is broken across lines")
+        print("\nprompt: `AgentError` was documented but never injected, so the")
+        print("        idiom the prompt taught would have raised NameError")
+        PLACEHOLDERS = {
+            "doc", "hits", "parts", "fs", "h", "h1", "h2", "hs", "r", "results",
+            "src", "key", "text", "value", "code", "python", "_7", "_N", "seed",
+            "prompt", "f", "live-variables", "files-you-have-changed", "out",
+            "id_rsa", "env", "ssh", "aws", "None", "PermissionError", "datetime",
+            "Decimal", "old", "new",
+        }
+        named = sorted(n for n in set(re.findall(r"`([A-Za-z_]\w*)`", SYSTEM))
+                       if n not in PLACEHOLDERS and not keyword.iskeyword(n))
+        missing = json.loads(k.probe(
+            "import json, builtins; print(json.dumps([n for n in "
+            f"{named!r} if n not in globals() and not hasattr(builtins, n)]))"))
+        check("every symbol the prompt names in backticks is really bound",
+              missing == [], f"documented but absent: {missing}")
+        check("isinstance() on a failed slot works now",
+              k.execute("isinstance(AgentError('l', 'm'), AgentError)").render().strip()
+              == "True")
+        check("the prompt teaches isinstance, not truthiness",
+              "isinstance(r, AgentError)" in SYSTEM)
+
+        print("\nprompt: invented keyword arguments (edit/grep/sh/peek/compress)")
+        real = {f.__name__: f for f in runtime.PUBLIC}
+        for fn, args in re.findall(r"(?<![\w.])([a-z_]\w*)\(([^)\n]*)\)", SYSTEM + DESC):
+            if fn not in real:
+                continue
+            params = set(inspect.signature(real[fn]).parameters)
+            invented = set(re.findall(r"(\w+)\s*=", args)) - params
+            check(f"{fn}() is documented with real parameter names", not invented,
+                  f"{sorted(invented)} are not parameters of {fn}")
+
+        print("\nprompt: compress() was described as immediate; it is queued")
+        check("compress() reports itself as queued",
+              "queued" in k.execute("compress()").render())
+        check("the prompt says so too",
+              "queues a compaction" in SYSTEM and "after the current cell" in SYSTEM)
+
+        print("\nprompt: done() was told to accept a dataclass, which the process")
+        print("        boundary refuses -- the answer silently degrades to a string")
+        sub.execute("from dataclasses import dataclass as _dc\n"
+                    "@_dc\nclass Finding:\n    path: str\n"
+                    "done(Finding('a.py'))")
+        refused = False
+        try:
+            sub.probe_pickle(DONE_EXPR)
+        except Exception:
+            refused = True
+        check("a locally defined dataclass really is refused", refused)
+        check("no prompt recommends returning one",
+              not any("dataclass" in p for p in (SYSTEM, SYSTEM_SUBAGENT, SUBAGENT_CODA)))
+        sub.execute("done({'path': 'a.py'})")
+        check("plain data still crosses", sub.probe_pickle(DONE_EXPR) == {"path": "a.py"})
+
+        print("\nprompt: the answer to a person was a done() value, so a dict repr")
+        print("        reached the terminal where sentences belonged")
+        fin = SYSTEM.split("# Finishing")[-1]
+        flat = " ".join(fin.split())
+        check("the top-level agent is told the call takes nothing",
+              "It takes no input" in flat, flat[:400])
+        check("the prompt puts the answer beside the call, not inside it",
+              "The text is the answer" in flat and "ordinary text" in flat, flat[:400])
+        check("it rules out handing a person a data structure",
+              "not an answer to a person" in flat)
+        check("it says what finishing silently costs",
+              "turn with no tool in it" in flat, flat[:600])
+        check("the coda tells a subagent there is no such turn",
+              "no turn after your" in SUBAGENT_CODA, SUBAGENT_CODA[-400:])
+        check("the prompt names the finish as a tool, not as code to send",
+              "call `done` in that same turn" in flat, flat[:400])
+        check("and tells the model not to type it into the answer",
+              "Never type `done()` into the answer" in flat, flat[:600])
+        check("and never as a block the model can echo into its answer",
+              "\n    done()\n" not in SYSTEM,
+              "a standalone done() block invites the model to type it into the prose")
+        subfin = " ".join(SYSTEM_SUBAGENT.split("# Finishing")[-1].split())
+        check("the subagent's prompt sends done(value) as Python instead",
+              "one more line of code in the `python` tool" in subfin, subfin[:400])
+        check("and explains that naming a value beats transcribing it",
+              "not the capped view" in subfin, subfin[:600])
+        rendered = k.execute("done()").render()
+        check("a top-level done() redirects to the tool rather than finishing",
+              "`done` tool" in rendered and "does not finish" in rendered, rendered[:250])
+        check("passing a value anyway is answered, not silently kept",
+              "read by nobody" in k.execute("done({'n': 1})").render())
+        check("the ask for a missing answer lives on the path that needs it",
+              "no answer written" in inspect.getsource(Runner._answer))
+        rendered = sub.execute("done({'n': 1})").render()
+        check("a subagent's done() reports the value it hands back",
+              "'n': 1" in rendered and "does not finish" not in rendered, rendered[:200])
+        check("sample() can withhold the tools for that turn",
+              "tools" in inspect.signature(Provider.sample).parameters)
+        check("the result carries the prose separately from the value",
+              "answer" in {f.name for f in dataclasses.fields(RunResult)})
+
+        print("\nfinishing: a `done` tool call cost a turn to correct, which left the")
+        print("           answer stranded one turn away from the call that ended the run")
+        dn = _Block("done", "tu_d", None)
+        turn = assemble([py, dn], offer_done=True)
+        check("the finish is extracted, not made to compete with the cell",
+              turn.done and turn.done_id == "tu_d" and turn.code == "x = 1",
+              f"done={turn.done} code={turn.code!r}")
+        check("and is never reported back as a stray", turn.ignored_tools == [],
+              str(turn.ignored_tools))
+        turn = assemble([dn], offer_done=True)
+        check("a finish arriving alone leaves no call to act on",
+              turn.done and turn.tool_use_id is None, str(turn.tool_use_id))
+        turn = assemble([py, dn], offer_done=False)
+        check("a subagent is offered no such tool, so its `done` block is a stray",
+              not turn.done and turn.ignored_tools == ["done"], str(turn.ignored_tools))
+        check("the two roles are handed different tool sets",
+              [t["name"] for t in _prov(True)._tools()] == ["python", "done"]
+              and [t["name"] for t in _prov(False)._tools()] == ["python"])
+        check("a lone finish is not mistaken for a truncated turn",
+              "turn.tool_use_id or turn.done" in inspect.getsource(Provider.sample))
+        check("prose from a refused turn is carried to the finish after it",
+              "carried, stranded = stranded" in inspect.getsource(Runner._loop))
+
+        print("\ncell timeout: a fixed 180s wall meant a slow build could only")
+        print("              ever be discovered by being cut off at it")
+        from xagent.kernel import CELL_TIMEOUT, MAX_CELL_TIMEOUT
+        from xagent.provider import _cell_timeout
+        check("the tool advertises the timeout argument",
+              "timeout" in PYTHON_TOOL["input_schema"]["properties"],
+              str(PYTHON_TOOL["input_schema"]))
+        check("and both roles advertise it, from the one shared schema",
+              PYTHON_TOOL["input_schema"] is PYTHON_TOOL_SUBAGENT["input_schema"])
+        check("only `code` is required, so a plain call is unchanged",
+              PYTHON_TOOL["input_schema"]["required"] == ["code"])
+        check("the default quoted to the model is the kernel's own",
+              f"{CELL_TIMEOUT:g} seconds" in PYTHON_TOOL["description"]
+              and inspect.signature(Kernel.execute).parameters["timeout"].default
+                  == CELL_TIMEOUT)
+        check("nothing is asked for when nothing was passed", _cell_timeout(None) is None)
+        check("a request above the cap is clamped, not refused",
+              _cell_timeout(10_000) == MAX_CELL_TIMEOUT)
+        for junk in ("soon", -5, 0, float("nan"), [30]):
+            check(f"{junk!r} is dropped, so the cell still runs under the default",
+                  _cell_timeout(junk) is None)
+        check("a number sent as a string is still honoured", _cell_timeout("300") == 300)
+        out = k.execute("import time\ntime.sleep(2)", timeout=0.5)
+        check("the notice names the limit that fired",
+              "timed out after 0.5s" in out.render(), out.render())
+        check("and points at the argument that raises it", "`timeout`" in out.render())
+
+        print("\nprompt: constants quoted in prose must match the code")
+        check("the cell-elision figure matches MAX_CODE_CHARS", str(MAX_CODE_CHARS) in SYSTEM,
+              f"prompt should quote {MAX_CODE_CHARS}")
+        subs = SYSTEM.split("# Subagents")[-1]
+        for label, value in (("depth", config.MAX_AGENT_DEPTH),
+                             ("session cap", config.MAX_TOTAL_AGENTS),
+                             ("concurrency", spawn.MAX_CONCURRENCY)):
+            check(f"the {label} limit in the prompt matches the code", str(value) in subs,
+                  f"{value} missing from the subagent section")
+
+        print("\nprompt: an unescaped \\n once split a code example in place, so")
+        print("        every indented example is compiled rather than eyeballed")
+        # Strip the generated listing first: it is indented like an example but is
+        # a signature table, not Python, and compiling it would always fail.
+        listing = textwrap.indent(runtime.inventory(include_done=False), "    ")
+        check("the generated listing is embedded verbatim", listing in SYSTEM,
+              "prompts.SYSTEM no longer carries runtime.inventory()")
+        check("the top-level listing does not offer done() as a helper",
+              "done(" not in listing, listing[-300:])
+        sub_listing = textwrap.indent(runtime.inventory(include_done=True), "    ")
+        check("the subagent's listing does, because that is how it finishes",
+              "done(" in sub_listing and sub_listing in SYSTEM_SUBAGENT,
+              "prompts.SYSTEM_SUBAGENT no longer carries the full listing")
+        body = SYSTEM.replace(listing, "")
+        blocks = [textwrap.dedent(b) for b in
+                  re.findall(r"\n\n((?:(?:    .*)?\n)+)", body) if b.strip()]
+        check("the prompt still carries worked examples", len(blocks) >= 2, str(len(blocks)))
+        for i, src in enumerate(blocks, 1):
+            try:
+                compile(src, f"<prompt example {i}>", "exec")
+                ok, why = True, ""
+            except SyntaxError as e:
+                ok, why = False, f"{e.msg} at line {e.lineno}"
+            check(f"code example {i} is valid Python", ok, why)
         check("triple quotes in examples are balanced", SYSTEM.count('\"\"\"') % 2 == 0)
+
+        print("\nnamespace listing: hand-written, it was already wrong -- missing")
+        print("                   optional parameters and naming an unbound class")
+        listing = runtime.inventory()
+        check("it lists every installed helper",
+              all(o.__name__ in listing for o in runtime.PUBLIC), listing[:200])
+        check("it lists nothing that is not installed",
+              not (set(re.findall(r"^(\w+)\(", listing, re.M))
+                   - {o.__name__ for o in runtime.PUBLIC}))
+        check("no row is blank for want of a docstring",
+              not re.search(r"^\s+\.\.\.$", listing, re.M), listing[:200])
+        check("optional parameters are present because they are introspected",
+              "max_hits=5000" in listing and "count=1" in listing and "cwd=None" in listing)
+        check("helpers() prints the same listing the prompt carries",
+              k.execute("helpers()").render().strip().startswith(listing.split("\n")[0]))
+        check("the prompt says plainly that none of it is a tool",
+              "None of them is a tool" in SYSTEM)
 
     finally:
         k.shutdown()
+        sub.shutdown()
 
     print(f"\n{'─' * 60}\n{len(PASS)} passed, {len(FAIL)} failed")
     for name in FAIL:

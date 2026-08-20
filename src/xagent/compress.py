@@ -50,6 +50,16 @@ terse prose over headings. No preamble.
 </cells>"""
 
 
+def var_table_failed(exc: Exception) -> str:
+    """What stands in for the table when the kernel could not be introspected.
+
+    Shared with the runner so both places that carry a table say the same thing:
+    the blocks it lands in are labelled authoritative, and one of them is written
+    into the transcript for good.
+    """
+    return f"  (introspection failed: {type(exc).__name__}: {exc})"
+
+
 @dataclass
 class CompactionEvent:
     kind: str
@@ -227,17 +237,27 @@ class Compressor:
             table = kernel.probe(
                 "import xagent.runtime as _r; _r._emit_var_table()", timeout=45
             )
-            if not table:
-                return "  (no user variables)"
-            rows = [ln.strip() for ln in table.splitlines() if ln.strip()]
-            extra = len(rows) - self.MAX_TABLE_ROWS
-            if extra > 0:
-                rows = rows[: self.MAX_TABLE_ROWS]
-                rows.append(f"… {extra:,} more variables (use %whos in a cell)")
-            # probe() strips the payload, which would eat the first row's indent.
-            return "\n".join("  " + r for r in rows)
         except Exception as e:
-            return f"  (introspection failed: {type(e).__name__}: {e})"
+            return var_table_failed(e)
+        return self._format_var_table(table)
+
+    def _format_var_table(self, table: str) -> str:
+        """Cap and indent a raw table.
+
+        Split from the probe that fetches one because the runner already has its
+        table in hand: it rides back on the cell itself, in the payload the
+        in-kernel hook appends, rather than costing a round-trip of its own.
+        Compaction still probes, because it happens between cells.
+        """
+        if not table:
+            return "  (no user variables)"
+        rows = [ln.strip() for ln in table.splitlines() if ln.strip()]
+        extra = len(rows) - self.MAX_TABLE_ROWS
+        if extra > 0:
+            rows = rows[: self.MAX_TABLE_ROWS]
+            rows.append(f"… {extra:,} more variables (use %whos in a cell)")
+        # probe() strips the payload, which would eat the first row's indent.
+        return "\n".join("  " + r for r in rows)
 
     def _summarize(self, store: ContextStore, targets) -> str:
         body: list[str] = []

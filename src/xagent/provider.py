@@ -14,23 +14,102 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import anthropic
+import httpx
 
 from xagent import config
 from xagent.config import Backend
+from xagent.kernel import CELL_TIMEOUT, MAX_CELL_TIMEOUT
 
+# The middle of the python tool's description is the same for both roles; only the
+# first and last paragraphs -- which name the tools that exist and how the run ends
+# -- differ. Shared here so the two renderings cannot drift apart.
+_PYTHON_BODY = (
+    "State carries across calls: variables, imports and definitions all "
+    "survive, so one call is one cell of one long session, and a cell may "
+    "hold as many statements as the step needs. stdout is captured and the "
+    "value of the final expression is displayed, both capped -- a large value "
+    "shows as a one-line handle while the object itself stays whole in the "
+    "kernel. An exception prints a traceback and destroys nothing.\n\n"
+    f"A cell runs for {CELL_TIMEOUT:g} seconds by default and is then interrupted, "
+    f"which ends that cell but keeps the namespace. When you already know a step "
+    f"will take longer -- a build, an install, a large download, a long batch -- "
+    f"pass `timeout` with the seconds it needs (up to {MAX_CELL_TIMEOUT:g}) in the "
+    f"same call, rather than letting it be cut off and retried.\n\n"
+)
+
+_PYTHON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "code": {"type": "string", "description": "Python source to execute."},
+        "timeout": {
+            "type": "number",
+            "description": (
+                f"Optional. Seconds this cell may run before the kernel is "
+                f"interrupted. Defaults to {CELL_TIMEOUT:g}; raise it for a step "
+                f"you already know is slow. Capped at {MAX_CELL_TIMEOUT:g}."
+            ),
+        },
+    },
+    "required": ["code"],
+}
+
+# This string is the highest-attention place to state the contract: the Qwen chat
+# template renders it inside the `<tools>` block, above the system prompt. Prose,
+# not tables -- the template puts it through `tojson`, so every newline reaches the
+# model as a literal \n and any column alignment is destroyed.
 PYTHON_TOOL = {
     "name": "python",
     "description": (
-        "Run Python in your persistent IPython kernel. State carries across calls: "
-        "variables, imports, and definitions all survive. The value of the final "
-        "expression is displayed (capped), and stdout is captured. This is how you "
-        "both act and think -- one call per step."
+        "Run Python in a persistent IPython kernel. This and `done` are the only "
+        "tools that exist -- there is no shell tool and no file tool. Everything "
+        "you do, you do by writing Python here.\n\n"
+        + _PYTHON_BODY +
+        "The namespace already holds the helpers you reach for most -- files, "
+        "search, shell, subagents, context control -- plus the whole Python "
+        "standard library. Those are ordinary functions, not tools: write "
+        "`sh(\"git status\")` as code inside `code`. A tool call by any name "
+        "other than `python` or `done` runs nothing and wastes the turn."
     ),
-    "input_schema": {
-        "type": "object",
-        "properties": {"code": {"type": "string", "description": "Python source to execute."}},
-        "required": ["code"],
-    },
+    "input_schema": _PYTHON_SCHEMA,
+}
+
+# A subagent finishes by value, from inside the kernel, so for it `done` really is
+# a function and really is not a tool -- the contract this description has always
+# stated. It keeps that text; only the top level's changed.
+PYTHON_TOOL_SUBAGENT = {
+    "name": "python",
+    "description": (
+        "Run Python in a persistent IPython kernel. This is the only tool that "
+        "exists -- there is no shell tool, no file tool, no `done` tool. "
+        "Everything you do, you do by writing Python here.\n\n"
+        + _PYTHON_BODY +
+        "The namespace already holds the helpers you reach for most -- files, "
+        "search, shell, subagents, context control, `done` -- plus the whole "
+        "Python standard library. Those are ordinary functions, not tools: write "
+        "`sh(\"git status\")` or `done(value)` as code inside `code`. A tool call "
+        "by any name other than `python` runs nothing and wastes the turn -- "
+        "including `done`, which returns your result only when it arrives as one "
+        "more line of Python in this tool, never as a tool call of its own."
+    ),
+    "input_schema": _PYTHON_SCHEMA,
+}
+
+# Offered to the top-level agent only. It takes no input at all, which is the whole
+# reason it can be a tool: the answer is prose the model has to write out anyway,
+# so there is no value for an argument to carry -- unlike a subagent's result,
+# which lives in its kernel and would have to be transcribed to fit in one.
+DONE_TOOL = {
+    "name": "done",
+    "description": (
+        "End the run. Call it in the same turn as your final answer, which you "
+        "write as ordinary text beside this call: the text is the answer, and "
+        "this call is only the full stop after it. It takes no input -- there is "
+        "nothing to pass, and anything you would put here is an answer you should "
+        "have written as text. If you send a `python` call in the same turn, that "
+        "code runs first and the run ends after it. Call this only when the work "
+        "is genuinely finished; if a step failed, investigate instead."
+    ),
+    "input_schema": {"type": "object", "properties": {}},
 }
 
 
@@ -58,14 +137,41 @@ class Usage:
                 f"hit={self.cache_hit_rate:.0%}>")
 
 
+def _cell_timeout(raw) -> float | None:
+    """Validate the model's requested cell timeout.
+
+    Anything unusable -- a string, a negative, a NaN -- is dropped rather than
+    raised on: the cell it came with is real work, and running it under the
+    default beats failing the turn over an argument the model got wrong. A
+    request above the cap is clamped, not refused, for the same reason.
+    """
+    if raw is None:
+        return None
+    try:
+        secs = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not secs > 0 or secs != secs:  # non-positive or NaN
+        return None
+    return min(secs, MAX_CELL_TIMEOUT)
+
+
 @dataclass
 class Turn:
     text: str = ""
     thinking: str = ""
     thinking_blocks: list[dict] = field(default_factory=list)
     code: str | None = None
+    # The cell timeout the model asked for, already validated and clamped. None
+    # means it did not ask, and the kernel's default stands.
+    timeout: float | None = None
     tool_use_id: str | None = None
     tool_name: str | None = None
+    # The top-level finish. Set when a `done` tool block arrived; it is extracted
+    # rather than treated as a call to act on, so it never competes with `python`
+    # for the one acted-on slot and never lands in `ignored_tools`.
+    done: bool = False
+    done_id: str | None = None
     # Names of any further tool_use blocks in the same turn that were not acted
     # on, so the caller can correct the model without discarding what it did.
     ignored_tools: list[str] = field(default_factory=list)
@@ -89,6 +195,9 @@ class Provider:
         self.thinking = config.resolve_thinking(thinking)
         self.sampling = sampling or config.DEFAULT_SAMPLING
         self.client = anthropic.Anthropic(**config.client_kwargs(self.backend))
+        # Set by Runner to the role: the top level is offered `done` as a tool, a
+        # subagent is not (it finishes by value, from inside its kernel).
+        self.offer_done = True
         self.usage = Usage()
         self.calls = 0
         self.truncated_turns = 0
@@ -136,19 +245,33 @@ class Provider:
 
     # ------------------------------------------------------------------ helpers
 
-    def _thinking_kw(self, max_tokens: int) -> dict:
+    def _thinking_kw(self) -> dict:
+        """The thinking configuration. One shape, because both backends take it.
+
+        Adaptive is not a rename of the budget: the model decides how much to think
+        per turn and `output_config.effort` sets the depth it aims for. The old
+        `budget_tokens` shape failed silently at both ends -- ignored rather than
+        refused -- which is exactly how a `medium` run and a `high` run came out
+        indistinguishable. See config.THINKING_LEVELS for the measurements.
+
+        `display: "summarized"` is explicit because the default is `omitted` on the
+        current Claude models: thinking blocks would arrive with empty text, and the
+        CLI that streams them would show a long silence instead of the reasoning.
+        SGLang accepts the field, warns that it cannot suppress reasoning, and
+        emits it anyway -- which is what we want from it regardless.
+        """
         if not self.thinking:
-            return {}
-        budget = config.THINKING_BUDGETS[self.thinking]
-        # max_tokens must leave room for a visible answer on top of the budget, and
-        # budget_tokens must stay above the API minimum of 1024.
-        return {"thinking": {"type": "enabled",
-                             "budget_tokens": max(1024, min(budget, max_tokens - 512))}}
+            # Off has to be said. Both backends think by default -- the Claude
+            # models adaptively, qwen because its template defaults to xhigh -- so
+            # omitting the field asks for the most thinking, not none.
+            return {"thinking": {"type": "disabled"}}
+        return {"thinking": {"type": "adaptive", "display": "summarized"},
+                "output_config": {"effort": self.thinking}}
 
     def _budget(self) -> int:
-        if not self.thinking:
-            return self.max_tokens
-        return max(self.max_tokens, config.THINKING_BUDGETS[self.thinking] + 2048)
+        # Nothing to leave room for any more: effort has no token budget of its own,
+        # max_tokens bounds the whole turn, and the model paces itself inside it.
+        return self.max_tokens
 
     def system_blocks(self, system: str) -> list[dict]:
         blocks: list[dict] = []
@@ -214,17 +337,29 @@ class Provider:
         Deadline-bounded: APITimeoutError subclasses APIConnectionError and is
         retryable at both layers, so attempt-count alone would allow hours of
         stacked timeouts on a single request.
+
+        `httpx.TransportError` is caught alongside the SDK's own errors because
+        the SDK does not wrap it here. It converts what happens while *sending*
+        the request, but a stream that dies while being *read* -- a server that
+        closes mid-body, the `RemoteProtocolError: incomplete chunked read` a
+        local inference server produces when it drops a decode -- raises straight
+        out of the iterator. Uncaught, that ended runs sixty turns deep over one
+        dropped connection.
         """
         delay = 2.0
         deadline = time.monotonic() + self.RETRY_DEADLINE
         for attempt in range(5):
+            # Per attempt, not per request: the previous attempt relayed part of a
+            # tool call before it died, and diffing this attempt's code against
+            # that leftover snapshot would relay none of it.
+            self._code_seen = ""
             try:
                 with self.client.messages.stream(**kw) as stream:
                     for event in stream:
                         self._relay(event)
                     return stream.get_final_message()
             except (anthropic.RateLimitError, anthropic.InternalServerError,
-                    anthropic.APIConnectionError) as e:
+                    anthropic.APIConnectionError, httpx.TransportError) as e:
                 self.last_retry = f"{type(e).__name__}: {str(e)[:120]}"
                 if attempt == 4 or time.monotonic() + delay > deadline:
                     raise
@@ -239,17 +374,25 @@ class Provider:
 
     # ------------------------------------------------------------------- sample
 
-    def sample(self, system: str, messages: list[dict]) -> Turn:
+    def sample(self, system: str, messages: list[dict], *, tools: bool = True) -> Turn:
         """Sample one turn, retrying a turn that reasoned itself out of room.
 
         A reasoning model can spend its whole output budget thinking and stop before
         emitting the tool call. That is not the model declining to act, so widen the
         budget and ask again rather than treating it as the end of the run.
+
+        `tools=False` withholds the tool for the final answer turn, where the
+        deliverable is prose. The same retry applies, against text rather than a
+        tool call: an answer that never arrived is the same failure.
         """
         budget = self._clamp(self._budget(), system, messages)
         for _ in range(3):
-            turn = self._sample_once(system, messages, budget)
-            if turn.tool_use_id or turn.stop_reason != "max_tokens":
+            turn = self._sample_once(system, messages, budget, tools=tools)
+            # A lone `done` call is a produced turn: the model acted, it simply
+            # acted by finishing. Reading it as truncation would re-ask, at full
+            # price, for a turn that already said everything it meant to.
+            produced = (turn.tool_use_id or turn.done) if tools else turn.text.strip()
+            if produced or turn.stop_reason != "max_tokens":
                 return turn
             wider = self._clamp(budget * 2, system, messages)
             if wider <= budget:
@@ -261,10 +404,16 @@ class Provider:
             self.truncated_turns += 1
         return turn
 
-    def _sample_once(self, system: str, messages: list[dict], budget: int) -> Turn:
+    def _tools(self) -> list[dict]:
+        if self.offer_done:
+            return [PYTHON_TOOL, DONE_TOOL]
+        return [PYTHON_TOOL_SUBAGENT]
+
+    def _sample_once(self, system: str, messages: list[dict], budget: int,
+                     *, tools: bool = True) -> Turn:
         self._code_seen = ""
         params, extra = self._sampling_kw()
-        thinking = self._thinking_kw(budget)
+        thinking = self._thinking_kw()
         # No sampling override here: _sampling_kw already returns nothing for the
         # Anthropic API, which is the only backend that rejects sampling alongside
         # extended thinking. Blanking it unconditionally would strip qwen's
@@ -275,7 +424,7 @@ class Provider:
             max_tokens=budget,
             system=self.system_blocks(system),
             messages=messages,
-            tools=[PYTHON_TOOL],
+            tools=self._tools() if tools else anthropic.NOT_GIVEN,
             extra_body=extra,
             **params,
             **thinking,
@@ -303,6 +452,19 @@ class Provider:
             elif block.type == "tool_use":
                 tool_blocks.append(block)
 
+        # The finish is extracted before anything competes for the acted-on slot.
+        # It is not a call to run: it is the turn saying it is the last one, and a
+        # `python` block beside it still deserves to run. Only the top level is
+        # offered it; for a subagent a `done` block is a stray like any other, and
+        # falls through to the correction below -- guessing at the value it meant
+        # to return would fabricate the subagent's whole result.
+        if self.offer_done:
+            finish = next((b for b in tool_blocks if b.name == "done"), None)
+            if finish is not None:
+                turn.done = True
+                turn.done_id = finish.id
+                tool_blocks = [b for b in tool_blocks if b is not finish]
+
         # A turn can carry more than one tool_use block -- qwen is trained with
         # shell tools and reaches for one it was never given. Last-write-wins let
         # that stray block overwrite a perfectly good `python` call, so the code
@@ -315,6 +477,8 @@ class Provider:
             turn.tool_name = acted.name
             turn.tool_use_id = acted.id
             turn.code = (acted.input.get("code") or "") if isinstance(acted.input, dict) else ""
+            if isinstance(acted.input, dict):
+                turn.timeout = _cell_timeout(acted.input.get("timeout"))
             turn.ignored_tools = [b.name for b in tool_blocks if b is not acted]
         return turn
 
@@ -331,6 +495,10 @@ class Provider:
             system.append({"type": "text", "text": config.CLAUDE_CODE_SYSTEM})
 
         params, extra = self._sampling_kw()
+        # A 300-word summary is not what deep reasoning is for, and on a model that
+        # thinks by default the whole budget can go to it -- which is the failure
+        # this loop's widen-and-retry was written for. Ask for the shallow end.
+        effort = {"output_config": {"effort": "low"}}
         for budget in (max_tokens, max_tokens * 3):
             with self.muted():
                 resp = self._create(
@@ -339,6 +507,7 @@ class Provider:
                     system=system or anthropic.NOT_GIVEN,
                     messages=[{"role": "user", "content": prompt}],
                     extra_body=extra,
+                    **effort,
                     **params,
                 )
             self.calls += 1

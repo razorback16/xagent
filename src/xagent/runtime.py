@@ -18,13 +18,42 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from xagent.brief import MAX_CHARS, raw_write, safe_brief
+# Safe at module scope: spawn imports runtime only inside _check_seed().
+# _depth() is spawn's, because depth is a property of the spawn chain: 0 in the
+# kernel the user started, higher in every kernel a subagent runs in.
+from xagent.spawn import MAX_TURNS as SUBAGENT_MAX_TURNS, AgentError, _depth
+
+
+def _is_subagent() -> bool:
+    """Whether a program is waiting for this kernel, rather than a person.
+
+    Deliberately not `_depth() > 0`. Depth answers a different question -- how far
+    down the spawn chain this kernel sits -- and the two only happen to coincide.
+    Keying the finishing contract on the coincidence made a Runner whose role and
+    depth disagreed fail silently: its done() would never signal and the run would
+    spin to the turn limit. The role is set explicitly by the harness, always.
+    """
+    return os.environ.get("XAGENT_ROLE") == "subagent"
+
+# The markers that fence a control payload off from the model's own output on the
+# way back over the wire. \x1e (RS) is a control character no ordinary program
+# prints, and the nonce -- fresh for every cell, pushed in just before it runs --
+# is what stops model code that happens to print a lookalike from being mistaken
+# for the harness talking to itself.
+CTL_BEGIN = "\x1e<<XACTL:{}>>"
+CTL_END = "<<XACTL-END:{}>>\x1e"
 
 _STATE: dict = {
     "done": None,        # one-tuple once done() is called, so None stays a legal answer
+    "finish": None,      # which verb ended the run, for the harness to report
     "notes": {},
     "compress": None,
     "ctx": {},
     "spawned": 0,
+    # Armed by the harness before each model cell, disarmed by the hook that reads
+    # it. Absent means "this cell is not one the harness is listening to", which is
+    # true of every probe -- and is what keeps a probe's stdout free of payloads.
+    "turn": None,
     # Filesystem mutations, recorded as they happen. Which files a session touched
     # is a fact, and facts belong in a ledger rather than in summary prose -- the
     # same reasoning that makes the variable table authoritative over the summary.
@@ -115,6 +144,7 @@ def read(path, lines: tuple[int, int] | None = None) -> str:
 
 
 def write(path, text: str) -> str:
+    """Create or overwrite a file; returns a one-line confirmation."""
     p = _resolve(path)
     existed = p.exists()
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +203,7 @@ def _emit_file_ledger() -> None:
 
 
 def ls(path=".", depth: int = 1) -> list[str]:
+    """List a directory; dotfiles and noise dirs are omitted."""
     root = _resolve(path)
     out: list[str] = []
     for entry in sorted(root.iterdir()):
@@ -316,7 +347,7 @@ def ctx() -> None:
 
 
 def compress(mode: str = "evict", before: int | None = None) -> str:
-    """Compact your own context. Variables stay live and exact.
+    """Queue a compaction, applied after this cell. Variables stay live and exact.
 
     mode="fold"   drop the *outputs* of old cells, keep the code (cheap, reversible
                   in effect: you can re-run anything).
@@ -333,8 +364,32 @@ def compress(mode: str = "evict", before: int | None = None) -> str:
 
 
 def done(value=None):
-    """Finish. `value` is returned to whoever asked (the user, or a parent agent)."""
+    """Finish a subagent run, handing `value` back to the parent's Python.
+
+    Who is waiting decides how a run ends, and the two callers are not alike. A
+    subagent reports to a program, and its result is an object that lives in this
+    kernel -- often one it has never seen whole, because the display caps it. So
+    it finishes here, by reference: name the value and cloudpickle carries it
+    across the process boundary intact.
+
+    The top-level agent reports to a person, and its answer is prose it has to
+    write out either way. There is nothing for a value channel to carry, so that
+    run finishes through the `done` tool instead, and this function does nothing
+    at depth 0 but say so.
+    """
+    if not _is_subagent():
+        # Deliberately not raising and not signalling. A model reaching for the
+        # old spelling out of habit needs redirecting, not a traceback, and it
+        # must not be able to end the run from in here -- the run ends on the
+        # tool call, which is the one place the harness can see it coming.
+        extra = "" if value is None else (
+            " The value would be read by nobody: write what matters into the answer."
+        )
+        return ("[done() does not finish this run — write the answer as ordinary text "
+                "and call the `done` tool in the same turn.]" + extra)
     _STATE["done"] = (value,)
+    _STATE["finish"] = "done"
+    # A parent may well read this one: it says what crossed back.
     return f"[done] {safe_brief(value)}"
 
 
@@ -342,7 +397,7 @@ def done(value=None):
 
 
 def agent(prompt: str, *, seed: dict | None = None, model: str | None = None,
-          max_turns: int = 30, label: str | None = None):
+          max_turns: int = SUBAGENT_MAX_TURNS, label: str | None = None):
     """Spawn a subagent with its own kernel and its own context window.
 
     It starts fresh: it sees `prompt` and whatever you hand it in `seed`, nothing
@@ -424,18 +479,23 @@ def _var_table() -> str:
     return "\n".join(rows)
 
 
-def _signals() -> str:
+def _signals_dict() -> dict:
     """Drain pending control signals. Called by the harness, never by the model."""
     payload = {
         "done": _STATE["done"] is not None,
         "done_brief": safe_brief(_STATE["done"][0]) if _STATE["done"] else None,
+        "finish": _STATE["finish"],
         "compress": _STATE["compress"],
         "notes": dict(_STATE["notes"]),
         "spawned": _spawn_count(),
         "vars": len(_user_vars()),
     }
     _STATE["compress"] = None
-    return json.dumps(payload)
+    return payload
+
+
+def _signals() -> str:
+    return json.dumps(_signals_dict())
 
 
 def _emit_signals() -> None:
@@ -445,6 +505,64 @@ def _emit_signals() -> None:
 
 def _emit_var_table() -> None:
     raw_write(_var_table())
+
+
+def _arm_turn(info: dict, want_vars: bool, nonce: str) -> None:
+    """Prime this kernel to report on the next cell it runs.
+
+    Pushed in ahead of the cell rather than probed for afterwards. The accounting
+    is stored first, so a table that fails to render later (a `__len__` that
+    raises, a monstrous namespace) does not also cost the model its ctx().
+    """
+    _set_ctx(info)
+    _STATE["turn"] = {"want_vars": want_vars, "nonce": nonce}
+
+
+def _turn_payload(want_vars: bool) -> dict:
+    """Everything the harness needs after a cell, in one payload.
+
+    Three probes stood here once -- signals, ledger, table -- each a serial
+    round-trip into this process, paid every turn. The table is rendered only when
+    asked for: until history has been evicted the cells themselves still say what
+    is live, and walking the namespace to say it again is the expensive half.
+    """
+    return {
+        "v": 1,
+        "signals": _signals_dict(),
+        "files": _file_ledger(),
+        "vars": _var_table() if want_vars else None,
+    }
+
+
+def _post_cell(result=None) -> None:
+    """Emit the turn payload after a model cell. Registered on `post_run_cell`.
+
+    Disarms first, before anything that can fail: a leftover arm would attach a
+    payload to the next cell that ran, and the next cell is very often a probe
+    whose stdout is parsed as JSON or a pickle.
+    """
+    arm = _STATE["turn"]
+    _STATE["turn"] = None
+    if not arm:
+        return
+    nonce = arm["nonce"]
+    try:
+        body = json.dumps(_turn_payload(arm["want_vars"]))
+    except Exception as e:
+        # A complete payload that says "this failed" is recoverable; half a
+        # payload is not. The harness falls back to a probe when it sees this.
+        body = json.dumps({"v": 1, "error": f"{type(e).__name__}: {e}"})
+    try:
+        raw_write(CTL_BEGIN.format(nonce) + body + CTL_END.format(nonce))
+    except Exception:
+        # Nothing left to say it with. Absence reads as "no payload" and takes
+        # the same fallback as an error one.
+        pass
+
+
+def _emit_turn_payload(want_vars: bool = False) -> None:
+    """The fallback path: the same payload, fetched by probe rather than pushed."""
+    raw_write(json.dumps(_turn_payload(want_vars)))
 
 
 def _spawn_count() -> int:
@@ -469,10 +587,54 @@ def _ipython():
         return None
 
 
+def inventory(include_done: bool = True) -> str:
+    """The namespace listing, generated from the live objects.
+
+    Generated rather than written down, so it cannot drift from what `install()`
+    actually bound. Rendered into the system prompt at import time, and available
+    in-kernel through `helpers()`.
+
+    `include_done` is False for the top-level agent, where finishing is the `done`
+    tool and this function is only a redirect. It stays bound either way -- what
+    changes is whether the listing offers it as something to reach for.
+    """
+    import inspect
+    import textwrap
+
+    lines = []
+    for obj in PUBLIC:
+        if obj is done and not include_done:
+            continue
+        try:
+            params = ", ".join(
+                str(p.replace(annotation=inspect.Parameter.empty))
+                for p in inspect.signature(obj).parameters.values()
+            )
+            rendered = f"{obj.__name__}({params})"
+        except (TypeError, ValueError):
+            rendered = obj.__name__
+        doc = (inspect.getdoc(obj) or "").split("\n")[0]
+        # Signature and summary on separate lines: `grep` and `agent` are wide
+        # enough that a single aligned column would wrap, losing the alignment the
+        # listing depends on to read as a REPL banner rather than a tool table.
+        lines.append(f"{rendered}")
+        lines.append(f"    {textwrap.shorten(doc, 66, placeholder='...')}")
+    lines.append("")
+    lines.append("Path, re, json are already imported; import anything else you need.")
+    return "\n".join(lines)
+
+
+def helpers() -> None:
+    """Print the namespace listing -- the same one the system prompt carries."""
+    # Matched to the role, so the listing printed here and the one in the system
+    # prompt never disagree about whether done() is something to call.
+    print(inventory(include_done=_is_subagent()))
+
+
 PUBLIC = [
     read, write, edit, ls, files, files_touched, grep, sh,
-    peek, note, ctx, compress, done, agent, gather,
-    Result, Hit,
+    peek, note, ctx, compress, done, agent, gather, helpers,
+    Result, Hit, AgentError,
 ]
 
 
@@ -485,6 +647,13 @@ def install(ns: dict) -> None:
     ns["re"] = re
     ns["json"] = json
     _TOOL_NAMES.extend(["Path", "re", "json"])
+
+    # Runs after brief's own post_run_cell hook, which is registered first by the
+    # bootstrap -- so the elision tail is flushed before the payload is appended.
+    ip = _ipython()
+    if ip is not None and not getattr(ip, "_xa_rt_hook", False):
+        ip.events.register("post_run_cell", _post_cell)
+        ip._xa_rt_hook = True
 
     seed_path = os.environ.get("XAGENT_SEED")
     if seed_path and Path(seed_path).is_file():

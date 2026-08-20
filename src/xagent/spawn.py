@@ -21,6 +21,11 @@ from xagent import config
 
 MAX_CONCURRENCY = 8
 
+# A subagent's turn limit. Half the top level's (runner.MAX_TURNS), because its
+# job is scoped and the cost multiplies by the fan-out -- but high enough that a
+# genuinely wide job is not cut off at the point where it would have returned.
+MAX_TURNS = 128
+
 _pool: ThreadPoolExecutor | None = None
 _lock = threading.Lock()
 _spawned = 0
@@ -111,7 +116,7 @@ def _work(prompt: str, seed, model, max_turns, thinking, sampling):
 
 
 def spawn(prompt: str, *, seed: dict | None = None, model: str | None = None,
-          max_turns: int = 30, label: str | None = None) -> Handle:
+          max_turns: int = MAX_TURNS, label: str | None = None) -> Handle:
     global _spawned
 
     label = label or (prompt.strip().split("\n")[0][:48] or "subagent")
@@ -131,6 +136,13 @@ def spawn(prompt: str, *, seed: dict | None = None, model: str | None = None,
 
     if seed is not None:
         _check_seed(seed)
+
+    # Start warming here rather than at the first acquire: the checks above can
+    # take a moment on a large seed, and a kernel built during them is one the
+    # subagent below does not wait for.
+    from xagent import pool
+
+    pool.ensure_started()
 
     backend = config.get_backend(os.environ.get("XAGENT_PROVIDER"))
     return Handle(

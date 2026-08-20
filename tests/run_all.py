@@ -19,6 +19,8 @@ SUITES = [
     ("test_mechanics", False),
     ("test_sampling", False),
     ("test_regressions", False),
+    ("test_finishing", False),
+    ("test_pool", False),
     ("test_compaction", True),
 ]
 

@@ -23,22 +23,38 @@ from pathlib import Path
 
 CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
 
-# Extended-thinking budgets in tokens, by level.
-THINKING_BUDGETS = {"low": 2048, "medium": 8192, "high": 24576}
+# Thinking depth, as a level rather than a token count -- `output_config.effort`,
+# which is the only knob either backend actually reads.
+#
+# The token budget it replaced was not merely deprecated, it was inert, and inert
+# without complaint at both ends. Measured against claude-opus-5, a request carrying
+# `budget_tokens` came back with no thinking at all and ran at the server default.
+# SGLang's Anthropic endpoint is explicit about it in code: budget_tokens is
+# "accepted for SDK compatibility but the local backend has no equivalent hard-cap
+# knob -- the budget is not enforced", logged and dropped. Both ends ignored the
+# level, so every level behaved like the default.
+#
+# What qwen does with the level is worth knowing, because it is not a cap there
+# either: SGLang maps effort onto `reasoning_effort`, the chat template turns that
+# into an instruction, and it folds high/max into xhigh -- so three distinct
+# behaviours, not five. Measured over three samples of one hard prompt: low ~1,040
+# thinking tokens, medium ~894 (medium inserts no instruction at all), xhigh ~6,401.
+# xhigh is also its default when no effort is sent.
+THINKING_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # Applied when the caller names no level. `off` is the only way to disable it, so
 # that "unspecified" and "deliberately none" stay distinguishable across the
 # subagent env handoff -- otherwise a child re-defaults to the level its parent
 # had just turned off.
 DEFAULT_THINKING = "medium"
 THINKING_OFF = "off"
-THINKING_CHOICES = (*sorted(THINKING_BUDGETS), THINKING_OFF)
+THINKING_CHOICES = (*THINKING_LEVELS, THINKING_OFF)
 
 
 def resolve_thinking(name: str | None) -> str | None:
     """Level to actually use. None means unspecified; `off` means none."""
     if name is None:
         return DEFAULT_THINKING
-    return name if name in THINKING_BUDGETS else None
+    return name if name in THINKING_LEVELS else None
 
 
 # Sampling presets recommended for Qwen 3.8. `extra` holds the parameters the
@@ -130,6 +146,12 @@ KEEP_RECENT = 10
 
 MAX_AGENT_DEPTH = 2
 MAX_TOTAL_AGENTS = 64
+
+# Kernels kept started and waiting, so spawning a subagent does not pay for one.
+# Deliberately well under spawn.MAX_CONCURRENCY: the pool is there to absorb the
+# front of a fan-out while its own replacements build, not to hold eight idle
+# interpreters at ~60MB each. Overridden by XAGENT_KERNEL_POOL; 0 disables.
+KERNEL_POOL_SIZE = 2
 
 
 def get_backend(name: str | None) -> Backend:
