@@ -73,7 +73,9 @@ static int atlasCols = 0, atlasRowH = 0;
 static unsigned char atlasTex[ATLAS_W * ATLAS_H];
 /* per character uv */
 static float uvU[256][2], uvV[256][2];
-static int   charW[256];
+static int   charW[256];     /* advance width per char */
+static int   glyphW[256], glyphH[256], glyphLeft[256], glyphTop[256];
+static int   fontAscent = 20;
 
 /* audio */
 static int  haveAudio = 0;
@@ -108,31 +110,38 @@ static Tone *toneNew(int n, int rate)
 }
 static void toneFree(Tone *t) { if (t) { free(t->buf); free(t); } }
 
-static int wavSize(int n, int rate) { return 44 + n * 2; }
+/* n = number of frames (each frame is a stereo pair) */
+static int wavSize(int n, int rate) { return 44 + n * 4; }
 
 static unsigned char *toWav(Tone *t)
 {
     int n = t->n, rate = t->rate, sz = wavSize(n, rate);
     unsigned char *w = malloc(sz);
     int i;
-    int32_t dataSize = n * 2;
+    int32_t dataSize = n * 4;   /* 2 channels x 2 bytes */
     /* RIFF header */
     memcpy(w + 0, "RIFF", 4);
     int32_t chunk = sz - 8; memcpy(w + 4, &chunk, 4);
     memcpy(w + 8, "WAVE", 4);
     memcpy(w + 12, "fmt ", 4);
     int32_t fmtsz = 16; memcpy(w + 16, &fmtsz, 4);
-    int16_t f1 = 1, f2 = 1; uint32_t r = rate;
-    memcpy(w + 20, &f1, 2); memcpy(w + 22, &f2, 2); memcpy(w + 24, &r, 4);
-    uint32_t byteRate = rate * 2; memcpy(w + 28, &byteRate, 4);
-    int16_t bps = 2; memcpy(w + 32, &bps, 2); memcpy(w + 34, &f1, 2);
+    int16_t f1 = 1, ch2 = 2; uint32_t r = rate;
+    memcpy(w + 20, &f1, 2); memcpy(w + 22, &ch2, 2); memcpy(w + 24, &r, 4);
+    uint32_t byteRate = rate * 4; memcpy(w + 28, &byteRate, 4);   /* 2ch x 16bit */
+    int16_t bps = 4, bits = 16; memcpy(w + 32, &bps, 2); memcpy(w + 34, &bits, 2);
     memcpy(w + 36, "data", 4); memcpy(w + 40, &dataSize, 4);
+    /* The mixer is opened with AUDIO_S16SYS stereo, and Mix_QuickLoad_WAV
+       copies the data as-is (no channel conversion), so emit true stereo
+       frames: each sample duplicated across both channels. Feeding mono
+       data made the mixer read pairs of samples as one stereo frame and
+       play everything at 2x speed. */
     for (i = 0; i < n; i++) {
         float s = t->buf[i];
         if (s >  1.f) s =  1.f;
         if (s < -1.f) s = -1.f;
         int16_t v = (int16_t)(s * 32767.f);
-        memcpy(w + 44 + i * 2, &v, 2);
+        memcpy(w + 44 + i * 4,     &v, 2);   /* L */
+        memcpy(w + 44 + i * 4 + 2, &v, 2);   /* R */
     }
     return w;
 }
@@ -197,15 +206,20 @@ static void initAudio(void)
     toneNote(t, 0, 0.05f, 220.f, 0.4f, 0.002f, 0.04f, 0, 0.f);
     sfxHit = chunkFromTone(t); toneFree(t);
 
-    /* die: descending slide */
+    /* die: descending slide. Phase must be accumulated per sample:
+       sin(2*pi*f(p)*p) makes the instantaneous frequency 2f(p)-440,
+       so the glide drops to zero and runs backwards before the tone
+       ends, which is the garbled "die" sound. */
     t = toneNew((int)(0.55f * 44100), 44100);
     {
         int i, n = t->n;
+        float phase = 0.f;
         for (i = 0; i < n; i++) {
             float p = (float)i / t->rate;
             float f = 440.f - 380.f * p / 0.55f;
             float env = 1.f - p / 0.55f;
-            t->buf[i] = sinf(2.f * (float)M_PI * f * p) * 0.4f * env;
+            t->buf[i] = sinf(phase) * 0.4f * env;
+            phase += 2.f * (float)M_PI * f / t->rate;
         }
     }
     sfxDie = chunkFromTone(t); toneFree(t);
@@ -239,6 +253,7 @@ static void initText(void)
         face = 0; return;
     }
     FT_Set_Pixel_Sizes(face, 0, 26);
+    fontAscent = face->size->metrics.ascender / 64;
 
     /* all printable ASCII (95 glyphs) -- comfortably fits the 512x256 atlas */
     char charSet[128];
@@ -259,7 +274,12 @@ static void initText(void)
             rowMaxH = 0;
         }
         if (h > rowMaxH) rowMaxH = h;
+        /* record per-glyph metrics; advance = width + 2px side bearing */
         charW[(unsigned char)chars[i]] = w + 2; /* +advance */
+        glyphW[(unsigned char)chars[i]]  = w;
+        glyphH[(unsigned char)chars[i]]  = h;
+        glyphLeft[(unsigned char)chars[i]] = left;
+        glyphTop[(unsigned char)chars[i]]  = top;
         /* blit alpha */
         {
             int r, c;
@@ -304,17 +324,24 @@ static void drawText(const char *s, float x, float y, float r, float g, float b,
         while (*tmp) { w += charW[(unsigned char)*tmp] * scale; tmp++; }
         x -= w * 0.5f;
     }
+    /* baseline sits `fontAscent` below the text top (y). Each glyph's
+       bitmap_top is measured from the baseline, so its screen row is
+       (y + fontAscent - bitmap_top); bitmap_left gives its horizontal
+       offset from the pen. All scaled by `scale`. */
+    float base = y + (float)fontAscent * scale;
     px = x;
     while (*s) {
         unsigned char ch = (unsigned char)*s++;
         if (ch == ' ' || !charW[ch]) { px += charW[ch] * scale; continue; }
-        float tw = face->glyph->bitmap.width * scale;
-        float th = 26 * scale;
+        float gx = px + (float)glyphLeft[ch] * scale;
+        float gy = base - (float)glyphTop[ch] * scale;
+        float tw = (float)glyphW[ch] * scale;
+        float th = (float)glyphH[ch] * scale;
         glBegin(GL_QUADS);
-        glTexCoord2f(uvU[ch][0], uvV[ch][0]); glVertex2f(px,       y);
-        glTexCoord2f(uvU[ch][1], uvV[ch][0]); glVertex2f(px + tw,  y);
-        glTexCoord2f(uvU[ch][1], uvV[ch][1]); glVertex2f(px + tw,  y + th);
-        glTexCoord2f(uvU[ch][0], uvV[ch][1]); glVertex2f(px,       y + th);
+        glTexCoord2f(uvU[ch][0], uvV[ch][0]); glVertex2f(gx,     gy);
+        glTexCoord2f(uvU[ch][1], uvV[ch][0]); glVertex2f(gx + tw, gy);
+        glTexCoord2f(uvU[ch][1], uvV[ch][1]); glVertex2f(gx + tw, gy + th);
+        glTexCoord2f(uvU[ch][0], uvV[ch][1]); glVertex2f(gx,     gy + th);
         glEnd();
         px += charW[ch] * scale;
     }
