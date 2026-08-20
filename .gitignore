@@ -12,3 +12,9 @@ wheels/
 # secrets
 .env
 .xagent/
+
+# editor scratch
+*.swp
+
+# session scratch
+temp-results/

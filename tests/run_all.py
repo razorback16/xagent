@@ -18,8 +18,11 @@ HERE = Path(__file__).parent
 SUITES = [
     ("test_mechanics", False),
     ("test_sampling", False),
+    ("test_vision", False),
+    ("test_audio", False),
     ("test_regressions", False),
     ("test_finishing", False),
+    ("test_subagents", False),
     ("test_pool", False),
     ("test_compaction", True),
 ]

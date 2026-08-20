@@ -16,6 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from xagent.audio import AudioAttachment
+from xagent.vision import IMAGE_TOKEN_ESTIMATE, ImageAttachment
+
 CACHE = {"type": "ephemeral"}
 
 FOLDED = "[output folded to reclaim context — the code above ran; its variables are still live]"
@@ -53,15 +56,25 @@ class Cell:
     # Raw thinking blocks, replayed verbatim when the backend demands it (Anthropic
     # rejects a tool-use continuation whose prior thinking blocks are missing).
     thinking_blocks: list[dict] = field(default_factory=list)
+    images: list[dict] = field(default_factory=list)
 
     @property
     def shown_output(self) -> str:
         return FOLDED if self.state == "folded" else self.output
 
+    @property
+    def shown_images(self) -> list[dict]:
+        # Images are cell output too. Tier-2 compaction promises to drop old
+        # outputs, so retaining their multimodal blocks would preserve most of
+        # the cost while claiming the cell was folded.
+        return self.images if self.state == "live" else []
+
     def tokens(self) -> int:
         if self.state == "evicted":
             return 0
-        return est_tokens(self.thought) + est_tokens(self.code) + est_tokens(self.shown_output) + 12
+        return (est_tokens(self.thought) + est_tokens(self.code)
+                + est_tokens(self.shown_output)
+                + len(self.shown_images) * IMAGE_TOKEN_ESTIMATE + 12)
 
 
 @dataclass
@@ -82,11 +95,14 @@ class ContextStore:
     calibration: float = 1.0
     live_vars: str = ""         # refreshed each turn once history has been evicted
     live_files: str = ""        # filesystem mutations, refreshed each turn
+    images: list[ImageAttachment] = field(default_factory=list)
+    audio: list[AudioAttachment] = field(default_factory=list)
 
     # ------------------------------------------------------------------ cells
 
     def add(self, code: str, output: str, tool_use_id: str, thought: str = "",
-            thinking_blocks: list[dict] | None = None, turn: int | None = None) -> Cell:
+            thinking_blocks: list[dict] | None = None, turn: int | None = None,
+            images: list[dict] | None = None) -> Cell:
         if len(code) > MAX_CODE_CHARS:
             keep = MAX_CODE_CHARS // 2
             dropped = len(code) - 2 * keep
@@ -98,6 +114,7 @@ class ContextStore:
         cell = Cell(n=n, code=code, output=output,
                     tool_use_id=tool_use_id, thought=thought,
                     thinking_blocks=thinking_blocks or [],
+                    images=images or [],
                     turn=n if turn is None else turn)
         self.cells.append(cell)
         return cell
@@ -134,6 +151,8 @@ class ContextStore:
     def estimated_tokens(self) -> int:
         base = est_tokens(self.system) + est_tokens(self.task) + est_tokens(self.state_report)
         base += sum(est_tokens(f"{k}: {v}") for k, v in self.notes.items())
+        base += len(self.images) * IMAGE_TOKEN_ESTIMATE
+        base += sum(clip.tokens() for clip in self.audio)
         return base + sum(c.tokens() for c in self.cells)
 
     def observe(self, real_tokens: int) -> None:
@@ -197,6 +216,41 @@ class ContextStore:
         opening: list[dict] = [{"type": "text", "text": f"<task>\n{self.task}\n</task>"}]
         if self.state_report:
             opening.append({"type": "text", "text": self.state_report})
+        if self.images:
+            labels = "\n".join(f"  - {image.path}" for image in self.images)
+            opening.append({
+                "type": "text",
+                "text": (
+                    "<attached-images>\n"
+                    f"{labels}\n"
+                    "The image content is attached below; use it as visual evidence.\n"
+                    "</attached-images>"
+                ),
+            })
+            opening.extend(image.content_block() for image in self.images)
+            # Keep the cache breakpoint on text. This is accepted by both the
+            # real Messages API and Anthropic-compatible servers, while the image
+            # blocks remain ordinary multimodal content.
+            opening.append({"type": "text", "text": "<end-attached-images>"})
+        if self.audio:
+            # Audio enters as a picture of itself. The text block carries the
+            # measurements the picture can only be read off approximately --
+            # duration, peak, how much of it is silence -- so the model is never
+            # squinting at a plot for a number it could be told.
+            body = "\n\n".join(clip.text_block() for clip in self.audio)
+            opening.append({
+                "type": "text",
+                "text": (
+                    "<attached-audio>\n"
+                    f"{body}\n"
+                    "An analysis panel for each clip is attached below: waveform, "
+                    "log-frequency spectrogram, level over time (all three sharing "
+                    "one time axis), and how long the clip spends at each level.\n"
+                    "</attached-audio>"
+                ),
+            })
+            opening.extend(clip.image_block() for clip in self.audio)
+            opening.append({"type": "text", "text": "<end-attached-audio>"})
         opening[-1]["cache_control"] = CACHE
 
         msgs: list[dict] = [{"role": "user", "content": opening}]
@@ -236,6 +290,10 @@ class ContextStore:
                     "tool_use_id": cell.tool_use_id,
                     "content": body,
                 }
+                if cell.shown_images:
+                    result["content"] = [
+                        {"type": "text", "text": body}, *cell.shown_images
+                    ]
                 if cell.n == anchor:
                     result["cache_control"] = CACHE
                 results.append(result)

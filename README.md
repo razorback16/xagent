@@ -78,10 +78,86 @@ Chosen explicitly with `-p`, not inferred from the model name.
 uv run xagent -p anthropic -m claude-sonnet-5 "…"
 uv run xagent -p codiv -t high "…"            # thinking:  low | medium | high
 uv run xagent -p codiv -s instruct "…"        # sampling:  thinking | instruct
+uv run xagent --image screenshot.png "review this UI screenshot"
 ```
 
 Both cache prefixes, by different mechanisms, so the compaction policy below earns
 its keep on both. Only Anthropic reports hit rates, so only there is it measurable.
+
+### Vision input
+
+Attach one or more local PNG, JPEG, GIF, or WebP images with `--image` (or `-i`):
+
+```bash
+uv run xagent --image screenshot.png "find the layout bug"
+uv run xagent -i before.png -i after.png "compare these screenshots"
+```
+
+Images are sent as multimodal content in the opening user message. They are loaded
+and validated before the model request; the Python API accepts the same paths through
+`Runner(..., images=["screenshot.png"])`.
+
+Raster images emitted by the REPL are supported too: `display(image)`, matplotlib,
+and other IPython rich display results are captured from `display_data` and attached
+to that cell's tool result, so the model can inspect them on the next turn.
+
+### Audio input
+
+A vision model cannot listen. It can look, so a clip enters the context window as a
+picture of itself — and the model reads that picture the way it reads a screenshot.
+
+```bash
+uv run xagent --audio interview.mp3 "when does the second speaker start?"
+uv run xagent --listen 20 "what is playing on my speakers right now?"
+uv run xagent --listen 30 --source mic "is this recording clipping?"
+```
+
+`--listen` records **what this machine is playing**, not the microphone. That is the
+harder of the two and the more useful: on PipeWire it targets the default sink node
+(recording a sink records what is being played to it), on PulseAudio it opens the
+sink's `.monitor` source, and it falls back to `ffmpeg -f pulse` — `--source mic`
+switches to the microphone, and any device name the sound server knows is accepted
+in its place. The default source is *checked* rather than trusted, because
+WirePlumber answers "default audio source" with the sink on a machine that has no
+capture device, and a `--source mic` that quietly recorded the speakers would be a
+wrong answer rather than a missing one.
+
+Every clip becomes four panels:
+
+- the **waveform**, min/max per column with the RMS drawn through it;
+- a **log-frequency spectrogram**, so 100 Hz and 8 kHz get comparable room;
+- **level over time** in dBFS, with the voice gate this clip's own floor implies;
+- a **histogram** of how long the clip spends at each level.
+
+The first three share one time axis, so a bright band in the spectrogram sits
+directly above the moment it happened in the others. The histogram is off that axis
+— its x is dBFS — which is why it sits below rather than beside. Duration, peak, RMS,
+how much is active and how much is silence are printed *with* the panel rather than
+left to be read off it: a picture is evidence, not a measuring instrument.
+
+Inside the kernel it is one function, and it works on files and on live audio alike:
+
+```python
+s = listen("speaker", 20)      # or listen("mic"), or listen("meeting.flac")
+s.zoom(4.5, 6.0)               # re-render a span; no re-capture, no re-read
+s.stats()["silence"]           # the numbers behind the picture
+peak = max(s.samples)          # the samples never left the kernel
+```
+
+Drawing all of that needs **no dependencies** — `plot.py` writes the PNG from
+`zlib` and a hand-built 5×7 font, and the FFT falls back to a pure-Python radix-2
+when numpy is absent (numpy is used when present, for speed only). One transform is
+computed per *pixel column* rather than per hop, so a ten-minute clip renders in
+about as long as a ten-second one. Compressed formats need `ffmpeg` on `PATH`;
+plain WAV decodes through the standard library.
+
+**Transcription is not wired in yet.** `asr.py` holds a complete, unexercised
+implementation of local streaming ASR against NVIDIA's
+`nemotron-3.5-asr-streaming-0.6b` in 8 bits — bitsandbytes/torchao int8 through
+Transformers, or the `q8_0` GGUF NVIDIA publishes through NeMo-Speech.cpp — behind
+`listen(..., transcribe=True)` and `uv sync --extra asr`. Nothing on the default
+path imports it, and no test covers it, because it has never been run against real
+weights.
 
 ### Output length and sampling
 
@@ -114,13 +190,18 @@ thinking fixes the sampling distribution and the API rejects them alongside it.
 read(path, lines=None)     write(path, text)      edit(path, old, new)
 ls(path, depth=1)          files(glob, path=".")  grep(pattern, glob="*")
 sh(cmd, timeout=120)       peek(x, n=40)          helpers()
+listen(src, seconds=15)    # speakers, mic or file -> a picture of the sound
 
 ctx()                      # live token budget and the heaviest cells
 note(key, text)            # pin a fact; survives every compaction
 compress()                 # queue a compaction, applied after this cell
 
 agent(prompt, seed=…)      # subagent: own kernel, own context window
-gather(handles)            # blocks, preserves input order
+gather(handles)            # blocks, preserves input order; no wall clock
+poll(handles=None)         # where every subagent has got to; never blocks
+send(handle, text)         # lands as an inbox() cell at its next turn
+kill(handle, reason="")    # stops it there, keeping what it produced
+inbox()                    # in a subagent: what the parent has sent you
 done(value)                # in a subagent: plain data back to the parent
 ```
 
@@ -169,6 +250,66 @@ often one it never saw whole, because the display is capped. It keeps the in-ker
 cost is ~10 output tokens no matter how large the value. A tool argument would be
 JSON the model has to type out, which for a value it only saw a `<list len=1,847>`
 handle of means fabricating it. That is why subagents are offered no `done` tool.
+
+## A subagent has no clock, so the parent talks to it instead
+
+A fan-out used to have exactly one control: wait. `gather()` blocked, and because
+the wait is itself a cell, the *cell* timeout — 180 seconds by default — cut it. The
+subagents carried on, invisibly, and the parent had no way to ask how they were
+doing, tell one it had changed its mind, or stop one that had gone the wrong way.
+
+Worse, the wait did not actually end. `Handle.result()` caught `BaseException`, so
+the `KeyboardInterrupt` the timeout delivers was swallowed into an `AgentError` for
+the *first* handle and the loop went right on blocking on the rest. The harness
+reported the cell as timed out while the kernel was still busy running it, so every
+later cell queued behind it and appeared to hang too. That is the whole of the
+reported failure, and it was one `except` clause.
+
+So: no wall clock anywhere on a subagent — it takes as long as its job takes — and
+three ways to reach a running one, none of which blocks.
+
+```python
+h = agent("port the mixer to SDL3", label="mixer")
+poll()                        # state, turn, tokens, and the last words it wrote
+send(h, "skip the tests")     # arrives as an inbox() cell at its next turn
+kill(h, "wrong approach")     # stops it there; its partial work is reported
+```
+
+**A message is a cell the child genuinely ran.** The text goes into the child's
+kernel and the harness executes `inbox()` there at the end of the current turn, so
+what lands in the transcript is an ordinary REPL block — it renders like every other
+cell, survives compaction like every other cell, and nothing downstream had to learn
+about a second kind of message. Nothing is fabricated into the assistant's mouth: the
+model did not write that call, and its turn id says so. Delivery costs at most one
+turn of latency.
+
+**A kill keeps the work.** It sets an event the child checks at every turn boundary
+*and* interrupts the child's kernel, so a child sitting in a long cell stops at once
+— measured live at **0.13s** against one asleep in `time.sleep(300)`. What comes back
+is an `AgentError` naming the reason, the turn it reached and the last thing it
+wrote, because a child killed at turn forty has forty turns of work behind it and
+reporting the kill with none of it is how a parent loses the only account of what
+happened. The same salvage now covers a child that crashes or exhausts its turns;
+both used to return a one-line error and nothing else.
+
+A timeout is no longer a synonym for failure either: a handle a `gather()` deadline
+catches comes back as an `AgentError` with `still_running=True`, and gathering it
+again picks the wait back up. `timeout=0` means "do not wait" rather than "wait
+forever", which is what it used to mean by accident.
+
+**Two clocks that were never bounded** turned up alongside this. A cell that
+swallows `KeyboardInterrupt` — a C extension, a thread it started, code catching
+`BaseException` — kept the harness reading its output for as long as it cared to
+produce it, because the five-second drain after an interrupt was only consulted where
+the message queue ran dry, and a cell that keeps printing never lets it. Measured at
+15 minutes inside `zmq_poll` on a cell the harness had already declared over. The
+drain is a hard bound now, and when the interrupt does not take, the cell says so
+instead of promising a namespace that has quietly gone on changing. Separately, a
+malformed `message_start` from the local server left the SDK's own stream accumulator
+calling `.to_dict()` on a plain dict and killed a subagent 1.7 seconds into its run;
+that is the same weather as a dropped decode and is retried the same way, narrowed to
+faults raised inside the SDK so a bug in our own delta handling still arrives as
+itself.
 
 ## Compaction
 
@@ -228,22 +369,32 @@ disables it.
 uv run python tests/run_all.py --offline   # everything below except compaction
 uv run python tests/test_mechanics.py      # 59 checks, no API calls
 uv run python tests/test_sampling.py       # 66 checks, no API calls
-uv run python tests/test_finishing.py      # 91 checks, no API calls
+uv run python tests/test_vision.py         # 16 checks, no API calls
+uv run python tests/test_audio.py          # 60 checks, no API calls
+uv run python tests/test_finishing.py      # 105 checks, no API calls
+uv run python tests/test_subagents.py      # 212 checks, no API calls
 uv run python tests/test_pool.py           # 24 checks, no API calls
-uv run python tests/test_regressions.py    # 168 checks, pins reviewed defects
-uv run python tests/test_compaction.py     # 23 checks, needs a provider
+uv run python tests/test_regressions.py    # 211 checks, pins reviewed defects
+uv run python tests/test_compaction.py     # 31 checks, needs a provider
 ```
 
-`test_regressions.py` exists because a five-way code review found real defects; each
+`test_audio.py` synthesizes its own sound, so it covers decoding, the measurements,
+the spectrum, the panel, the attachment path and `listen()` inside a real kernel
+without a model or a network. `test_regressions.py` exists because a five-way code
+review found real defects; each
 check names the bug it prevents from returning. `test_mechanics.py` covers the layer
 below the model: state persistence, display
 capping, stdout head+tail elision, the harness-side backstop, timeout and interrupt
 recovery, the tool surface, the turn payload, the variable table, and crossing the
 process boundary. `test_finishing.py` drives the finishing contract end to end
-against a scripted provider and a real kernel. `test_pool.py` checks that an adopted
+against a scripted provider and a real kernel, and `test_subagents.py` does the same
+for supervision: that an interrupt comes back out of `gather()` instead of being
+absorbed, that a message really becomes a cell the child ran, that a kill keeps the
+work, and that what `poll()` prints stays small enough to put in a context window. `test_pool.py` checks that an adopted
 kernel is indistinguishable from a cold one and that none outlives its parent.
-`test_compaction.py` drives tier-3 eviction with a real kernel and a real model, and
-asserts the needle stays recoverable.
+`test_compaction.py` drives image-aware tier-2 folding and tier-3 eviction with a
+real kernel and real model, then asserts the opening/protected images and the kernel
+needle stay recoverable while old visual output leaves the wire.
 
 ## Thinking depth is an effort level, not a token budget
 
@@ -322,10 +473,17 @@ five attempts on the same deadline-bounded backoff as a 429.
   this design; the write-heavy case is where it could plausibly *lose*, since code is
   never folded and a generated file body is emitted as a literal. Measure that one
   first. (M5 in the plan.)
+- **A message is delivered, not obeyed.** `send()` guarantees the text reaches the
+  child's transcript at its next turn boundary, and the subagent prompt says an
+  `inbox()` message outranks the task. Whether the model then does as it is told is
+  the model's business: measured against qwen, a child told mid-run to abandon its
+  task acknowledged the message in its return value and finished the original job
+  anyway. That is what `kill()` is for — it is the only control that does not depend
+  on the model agreeing.
 - **Fan-out is untested at scale.** A `gather()` over many subagents can outlive the
-  default 180s cell timeout — pass a larger `timeout` on that call — and the handles
-  survive an interrupt and can be re-gathered, but nothing yet proves the
-  O(1)-context claim at 30 agents.
+  default 180s cell timeout — the handles survive that interrupt, so `poll()` and a
+  later `gather()` pick them up — but nothing yet proves the O(1)-context claim at
+  30 agents.
 
 ## Layout
 
@@ -336,6 +494,11 @@ src/xagent/
   kernel.py    jupyter_client wrapper, one per agent; strips the turn payload
   pool.py      warm kernels, so spawning a subagent does not wait for one
   context.py   cells -> messages, cache breakpoints
+  vision.py    local and REPL image content blocks
+  audio.py     decode, measure and draw sound; the `listen()` handle
+  plot.py      a raster canvas and a PNG encoder, so audio needs no matplotlib
+  capture.py   recording the speakers or the microphone, as PCM chunks
+  asr.py       local 8-bit Nemotron ASR — written, not yet wired in
   compress.py  fold / evict / variable table
   provider.py  Anthropic-compatible adapter, both backends
   runner.py    the sample -> execute -> append loop

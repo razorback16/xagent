@@ -15,13 +15,14 @@ import queue
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from jupyter_client.kernelspec import KernelSpec
 from jupyter_client.manager import KernelManager
 
 from xagent.runtime import CTL_BEGIN, CTL_END
+from xagent.vision import SUPPORTED_MEDIA_TYPES
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
@@ -33,6 +34,13 @@ HARD_OUTPUT_CAP = 6000    # absolute backstop, in characters
 CELL_TIMEOUT = 180
 MAX_CELL_TIMEOUT = 3600   # an hour; past this a cell should be a background job
 STREAM_BUDGET = 400_000   # per-stream harness-side memory bound, in characters
+# How long a timed-out cell is given to notice the interrupt and go idle. It is a
+# hard bound, not a hope: a cell that ignores KeyboardInterrupt -- a C extension, a
+# thread it started, code that catches BaseException -- goes on emitting output, and
+# a drain that only checked its own deadline when the message queue happened to run
+# dry would keep reading that output forever. Measured once at 15 minutes inside
+# zmq_poll on a cell the harness had already reported as over.
+DRAIN_GRACE = 5.0
 # The control payload has its own budget, well clear of the stdout one: it is not
 # the model's output and must not be truncated by a cell that flooded the stream.
 CONTROL_BUDGET = 4_000_000
@@ -190,12 +198,20 @@ class CellOutput:
     timed_out: bool = False
     # The limit this cell ran under, so the timeout notice can name it.
     timeout: float | None = None
+    # Whether the kernel actually went idle. False means the interrupt did not
+    # take: the code may still be running, so the promise that the namespace is
+    # quiescent -- and that the next cell starts promptly -- does not hold.
+    stopped: bool = True
     # The control payload the in-kernel hook appended to this cell, already parsed
     # and already stripped out of `stdout`. None means none arrived; `control_error`
     # set means one did but could not be used, which is the harness's cue to fall
     # back to a probe rather than to proceed on a half-read payload.
     control: dict | None = None
     control_error: str | None = None
+    # Raster MIME payloads emitted by IPython display_data/execute_result messages.
+    # They remain structured content for the provider; they are never rendered as
+    # base64 in the textual transcript.
+    images: list[dict] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -209,15 +225,29 @@ class CellOutput:
             parts.append("[stderr]\n" + self.stderr.rstrip())
         if self.result:
             parts.append(self.result.rstrip())
+        if self.images:
+            noun = "image" if len(self.images) == 1 else "images"
+            parts.append(f"[{len(self.images)} {noun} displayed; attached for visual inspection]")
         if self.error:
             parts.append(self.error.rstrip())
         if self.timed_out:
             limit = f" after {self.timeout:g}s" if self.timeout else ""
-            parts.append(
-                f"[timed out{limit} — kernel interrupted; the namespace survived. "
-                f"Pass a larger `timeout` to this tool if the work genuinely needs "
-                f"longer, or run it in a background thread and poll it.]"
-            )
+            if self.stopped:
+                parts.append(
+                    f"[timed out{limit} — kernel interrupted; the namespace survived. "
+                    f"Pass a larger `timeout` to this tool if the work genuinely needs "
+                    f"longer, or run it in a background thread and poll it.]"
+                )
+            else:
+                # Saying "interrupted" here would be a lie the model then acts on:
+                # it reads the cell as over, writes the next one, and that cell
+                # queues behind the one still running and appears to hang too.
+                parts.append(
+                    f"[timed out{limit} — and the interrupt did not stop it. The code "
+                    f"is still running in the kernel, so the next cell will wait for "
+                    f"it to finish. Do not re-run this work; let it land, or expect "
+                    f"the wait.]"
+                )
         text = "\n".join(parts).strip() or "[no output]"
         if len(text) > cap:  # harness-side backstop
             keep = cap // 2
@@ -356,18 +386,25 @@ class Kernel:
         interrupted = False
 
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 and not interrupted:
-                self.km.interrupt_kernel()
-                out.timed_out = True
-                interrupted = True
-                deadline = time.monotonic() + 5  # drain the KeyboardInterrupt
-                continue
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                if not interrupted:
+                    self.km.interrupt_kernel()
+                    out.timed_out = True
+                    interrupted = True
+                    deadline = now + DRAIN_GRACE
+                    continue
+                # The drain window is over and the kernel never went idle. Checked
+                # here rather than only where the queue runs dry, because a cell
+                # that keeps printing never lets it run dry -- and this loop then
+                # outlives by minutes the moment the harness decided the cell had
+                # ended.
+                out.stopped = False
+                break
             try:
                 msg = self.kc.get_iopub_msg(timeout=max(0.05, min(remaining, 0.5)))
             except queue.Empty:
-                if interrupted and time.monotonic() > deadline:
-                    break
                 if not self.is_alive():
                     out.error = "[kernel died]"
                     break
@@ -391,11 +428,23 @@ class Kernel:
                 if budget > 0 and text:
                     sink.append(text[:budget])
             elif mtype in ("execute_result", "display_data"):
-                text = content.get("data", {}).get("text/plain")
+                data = content.get("data", {})
+                text = data.get("text/plain")
                 if text:
                     # Accumulate: a single slot meant earlier display() calls were
                     # silently overwritten by the last one.
                     results.append(strip_ansi(text))
+                for media_type in SUPPORTED_MEDIA_TYPES:
+                    encoded = data.get(media_type)
+                    if isinstance(encoded, str) and encoded:
+                        out.images.append({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": encoded,
+                            },
+                        })
             elif mtype == "error":
                 out.error = strip_ansi("\n".join(content.get("traceback", []))).strip()
             elif mtype == "status" and content.get("execution_state") == "idle":

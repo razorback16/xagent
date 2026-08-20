@@ -14,14 +14,14 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from xagent.audio import Sound
 from xagent.brief import MAX_CHARS, raw_write, safe_brief
 # Safe at module scope: spawn imports runtime only inside _check_seed().
-# _depth() is spawn's, because depth is a property of the spawn chain: 0 in the
-# kernel the user started, higher in every kernel a subagent runs in.
-from xagent.spawn import MAX_TURNS as SUBAGENT_MAX_TURNS, AgentError, _depth
+from xagent.spawn import MAX_TURNS as SUBAGENT_MAX_TURNS, AgentError
 
 
 def _is_subagent() -> bool:
@@ -50,6 +50,9 @@ _STATE: dict = {
     "compress": None,
     "ctx": {},
     "spawned": 0,
+    # Messages the parent agent has sent, waiting for the inbox() cell the harness
+    # runs at the next turn boundary.
+    "inbox": [],
     # Armed by the harness before each model cell, disarmed by the hook that reads
     # it. Absent means "this cell is not one the harness is listening to", which is
     # true of every probe -- and is what keeps a probe's stdout free of payloads.
@@ -304,10 +307,43 @@ def peek(x, n: int = 40, width: int = 200) -> None:
         used += len(clipped) + 1
     header = f"[peek {len(body)}/{total} {unit}]"
     if len(body) < min(n, total):
-        header += f" — stopped at the peek budget; slice it directly for more"
+        header += " — stopped at the peek budget; slice it directly for more"
     raw_write(header + "\n" + "\n".join(body) + "\n")
     if total > len(body):
         raw_write(f"… {total - len(body):,} more {unit}\n")
+
+
+def listen(source="speaker", seconds: float = 15, show: bool = True,
+           width: int = 960, transcribe: bool = False, lang: str = "auto") -> Sound:
+    """Look at sound: the speakers, the microphone, or an audio file.
+
+    `source` is "speaker" (what this machine is playing right now), "mic", a
+    device name the sound server knows, or the path of an audio file -- in which
+    case `seconds` is ignored and the whole file is read.
+
+    With `show`, the analysis panels are displayed, which attaches them to this
+    cell for you to read on the next turn: waveform, log-frequency spectrogram and
+    level over time on one shared axis, plus how long the clip spends at each
+    level. The samples stay in the kernel, so `zoom(a, b)` re-renders any span of
+    it and `.samples` is there for arithmetic the picture cannot answer.
+    """
+    from xagent.audio import Clip
+
+    p = Path(str(source)).expanduser()
+    if p.exists():
+        clip = Clip.from_path(_resolve(source))
+        label = str(p)
+    else:
+        from xagent import capture
+
+        clip = capture.record(source, seconds)
+        label = f"{source} {clip.seconds:.1f}s"
+    sound = Sound(clip=clip, source=label)
+    if transcribe:
+        from xagent.asr import transcribe_clip
+
+        sound.text = transcribe_clip(clip, lang=lang, on_text=raw_write).text
+    return sound.show(width=width) if show else sound
 
 
 def note(key: str, text: str | None = None):
@@ -409,6 +445,10 @@ def agent(prompt: str, *, seed: dict | None = None, model: str | None = None,
     Your context grows by one line no matter how many you spawn -- that is the
     point. Whatever the subagent passes to `done()` comes back as a real Python
     object, so you can filter and re-dispatch without re-reading anything.
+
+    It runs under no wall clock. While it works, `poll()` shows you where it has
+    got to, `send()` puts a message in front of it at its next turn, and `kill()`
+    stops it -- none of the three blocks.
     """
     from xagent.spawn import spawn
 
@@ -418,19 +458,83 @@ def agent(prompt: str, *, seed: dict | None = None, model: str | None = None,
 def gather(handles, timeout: float | None = None) -> list:
     """Block until every handle resolves; results keep the input order.
 
-    `timeout` is a deadline for the whole batch, not for each handle in turn.
-    A failed subagent yields an AgentError in its slot rather than raising, so one
-    bad apple does not discard the batch.
-    """
-    import time
+    There is no wall clock on a subagent: with no `timeout` this waits for exactly
+    as long as the work takes. `timeout` is a deadline for the whole batch rather
+    than for each handle in turn, and `timeout=0` polls once without waiting. A
+    handle the deadline caught is still running -- its slot holds an AgentError
+    that says so, and gathering it again picks the wait back up.
 
+    A failed subagent yields an AgentError in its slot rather than raising, so one
+    bad apple does not discard the batch. An interrupt is the exception: it means
+    this cell is being cut short, so it comes straight back out rather than being
+    absorbed into a slot while the kernel goes on waiting for the rest.
+    """
     handles = list(handles)
-    deadline = (time.monotonic() + timeout) if timeout else None
+    if timeout is not None and timeout < 0:
+        raise ValueError(f"timeout must not be negative, got {timeout}")
+    # `is not None`, because `timeout=0` means "do not wait" and used to read as
+    # "wait forever" -- the one reading nobody could have wanted.
+    deadline = (time.monotonic() + timeout) if timeout is not None else None
     out = []
-    for h in handles:
-        left = max(0.0, deadline - time.monotonic()) if deadline else None
-        out.append(h.result(timeout=left))
+    for i, h in enumerate(handles):
+        left = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+        try:
+            out.append(h.result(timeout=left))
+        except KeyboardInterrupt:
+            # Said out loud, because the interrupt is usually the cell timeout
+            # rather than a person, and a batch that vanished with it read as
+            # work that had been lost.
+            # Everything read defensively: this runs inside the interrupt handler,
+            # and an AttributeError raised here would replace the interrupt the
+            # branch exists to preserve.
+            live = [getattr(x, "label", "?") for x in handles[i:]
+                    if not getattr(x, "done", False)]
+            print(f"[gather] interrupted with {len(live)} subagent(s) still running: "
+                  f"{', '.join(live[:3])}{'…' if len(live) > 3 else ''}. They are "
+                  f"untouched and still working — poll() to watch them, gather() "
+                  f"again to collect them.")
+            raise
     return out
+
+
+def poll(handles=None) -> None:
+    """Print how every subagent is doing. Never waits for any of them."""
+    from xagent.spawn import status_table
+
+    print(status_table(handles))
+
+
+def send(handle, text: str) -> str:
+    """Send a message to a running subagent; it reads it at its next turn."""
+    return handle.send(text)
+
+
+def kill(handle, reason: str = "") -> str:
+    """Stop a subagent now, keeping the work it had already done."""
+    return handle.kill(reason)
+
+
+def inbox() -> None:
+    """Read what the parent agent has sent you, and clear it.
+
+    The harness runs this as a cell of its own at a turn boundary whenever a
+    message has arrived, so you will usually be reading its output rather than
+    calling it -- but calling it costs nothing and is how you check.
+
+    What it prints is your parent talking to you mid-run: instructions that arrived
+    after the task you were given, and that outrank it where they disagree.
+    """
+    if not _is_subagent():
+        print("[inbox] nothing sends here — you are the top-level agent, and the "
+              "person you work for talks to you through the task.")
+        return
+    pending, _STATE["inbox"] = _STATE["inbox"], []
+    if not pending:
+        print("[inbox] no messages from your parent.")
+        return
+    print(f"[inbox] {len(pending)} message(s) from the parent that spawned you:")
+    for message in pending:
+        print(f"  {message}")
 
 
 # ------------------------------------------------------- harness-side hooks
@@ -565,6 +669,16 @@ def _emit_turn_payload(want_vars: bool = False) -> None:
     raw_write(json.dumps(_turn_payload(want_vars)))
 
 
+def _deliver(text: str) -> None:
+    """Queue a parent's message for the inbox() cell the harness runs next.
+
+    Pushed in by the harness on the child's behalf, ahead of that cell, for the
+    same reason `_arm_turn` is: what the parent said is something the harness
+    knows and this kernel does not.
+    """
+    _STATE["inbox"].append(str(text))
+
+
 def _spawn_count() -> int:
     try:
         from xagent import spawn as _s
@@ -633,8 +747,9 @@ def helpers() -> None:
 
 PUBLIC = [
     read, write, edit, ls, files, files_touched, grep, sh,
-    peek, note, ctx, compress, done, agent, gather, helpers,
-    Result, Hit, AgentError,
+    peek, listen, note, ctx, compress, done,
+    agent, gather, poll, send, kill, inbox, helpers,
+    Result, Hit, Sound, AgentError,
 ]
 
 

@@ -80,7 +80,9 @@ def main() -> int:
         check("kernel is usable after a timeout", "42" in out.render(), out.render())
 
         print("\ntools in the namespace")
-        out = k.execute("sorted(files('*.py', path='src'))[:3]")
+        # Named rather than positional: asserting on the first three of a sorted
+        # listing made this fail every time a module was added to the package.
+        out = k.execute("[f for f in files('*.py', path='src') if f.endswith('brief.py')]")
         check("files() finds project sources", "brief.py" in out.render(), out.render()[:200])
         out = k.execute("hits = grep('def ', glob='*.py', path='src'); len(hits)")
         check("grep() returns hits", out.ok and int(out.render().strip() or 0) > 20, out.render())

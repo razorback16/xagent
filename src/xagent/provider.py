@@ -8,7 +8,7 @@ and the API's own stop handling.
 
 from __future__ import annotations
 
-import json
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -19,6 +19,7 @@ import httpx
 from xagent import config
 from xagent.config import Backend
 from xagent.kernel import CELL_TIMEOUT, MAX_CELL_TIMEOUT
+from xagent.vision import estimate_message_tokens
 
 # The middle of the python tool's description is the same for both roles; only the
 # first and last paragraphs -- which name the tools that exist and how the run ends
@@ -157,7 +158,8 @@ def _cell_timeout(raw) -> float | None:
         secs = float(raw)
     except (TypeError, ValueError):
         return None
-    if not secs > 0 or secs != secs:  # non-positive or NaN
+    # `not secs > 0` covers NaN too: every comparison against NaN is False.
+    if not secs > 0:
         return None
     return min(secs, MAX_CELL_TIMEOUT)
 
@@ -232,6 +234,29 @@ class Turn:
         self.timeout = first.timeout if first else None
 
 
+def _sdk_stream_fault(e: BaseException) -> bool:
+    """True when the SDK's own stream accumulator raised on a malformed event.
+
+    Observed against a local SGLang server: a `message_start` whose `message` the
+    SDK could not model-construct stays a plain dict, and the accumulator then
+    calls `.to_dict()` on it -- `AttributeError: 'dict' object has no attribute
+    'to_dict'`, raised straight out of the iterator. It killed a subagent 1.7
+    seconds into its run. That is the same weather as a dropped decode, and the
+    same answer applies: reissue the request.
+
+    Narrowed to frames inside the anthropic package on purpose. AttributeError and
+    TypeError are the two most likely shapes of a bug in our *own* delta handling,
+    and retrying one of those five times before reporting it would turn a plain
+    traceback into a slow mystery.
+    """
+    frame = e.__traceback__
+    while frame is not None:
+        if f"{os.sep}anthropic{os.sep}" in frame.tb_frame.f_code.co_filename:
+            return True
+        frame = frame.tb_next
+    return False
+
+
 class Provider:
     # Leave room for the request framing when clamping against the model window.
     WINDOW_MARGIN = 4_000
@@ -282,7 +307,7 @@ class Provider:
         window = self.backend.total_window
         if not window:
             return budget
-        approx_input = (len(system) + len(json.dumps(messages))) // 4
+        approx_input = len(system) // 4 + estimate_message_tokens(messages)
         room = window - approx_input - self.WINDOW_MARGIN
         if room < self.MIN_OUTPUT:
             # Flooring at MIN_OUTPUT here would send a request guaranteed to be
@@ -395,7 +420,8 @@ class Provider:
         closes mid-body, the `RemoteProtocolError: incomplete chunked read` a
         local inference server produces when it drops a decode -- raises straight
         out of the iterator. Uncaught, that ended runs sixty turns deep over one
-        dropped connection.
+        dropped connection. A malformed event that breaks the SDK's own
+        accumulator is retried on the same grounds; see `_sdk_stream_fault`.
         """
         delay = 2.0
         deadline = time.monotonic() + self.RETRY_DEADLINE
@@ -410,7 +436,10 @@ class Provider:
                         self._relay(event)
                     return stream.get_final_message()
             except (anthropic.RateLimitError, anthropic.InternalServerError,
-                    anthropic.APIConnectionError, httpx.TransportError) as e:
+                    anthropic.APIConnectionError, httpx.TransportError,
+                    AttributeError, TypeError) as e:
+                if isinstance(e, (AttributeError, TypeError)) and not _sdk_stream_fault(e):
+                    raise
                 self.last_retry = f"{type(e).__name__}: {str(e)[:120]}"
                 if attempt == 4 or time.monotonic() + delay > deadline:
                     raise

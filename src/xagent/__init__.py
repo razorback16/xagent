@@ -6,7 +6,8 @@ narration of what was done to it.
 
 __version__ = "0.1.0"
 
-__all__ = ["Runner", "Provider", "Kernel", "ContextStore", "Compressor", "main"]
+__all__ = ["Runner", "Provider", "Kernel", "ContextStore", "Compressor",
+           "ImageAttachment", "AudioAttachment", "Clip", "Sound", "main"]
 
 
 def __getattr__(name):  # lazy, so `import xagent` inside a kernel stays cheap
@@ -30,6 +31,14 @@ def __getattr__(name):  # lazy, so `import xagent` inside a kernel stays cheap
         from xagent.compress import Compressor
 
         return Compressor
+    if name == "ImageAttachment":
+        from xagent.vision import ImageAttachment
+
+        return ImageAttachment
+    if name in ("AudioAttachment", "Clip", "Sound"):
+        import xagent.audio
+
+        return getattr(xagent.audio, name)
     if name == "main":
         from xagent.cli import main
 

@@ -18,6 +18,8 @@ from xagent.context import ContextStore
 from xagent.kernel import Kernel, is_secret_key
 from xagent.prompts import SUBAGENT_CODA, SYSTEM, SYSTEM_SUBAGENT
 from xagent.provider import Provider
+from xagent.audio import AudioAttachment, normalize_audio
+from xagent.vision import ImageAttachment, normalize_images
 
 MAX_EMPTY_CALLS = 3
 
@@ -68,6 +70,11 @@ class RunResult:
     brief: str = ""
     degraded: bool = False   # value is a rendering, not the object done() was given
     turns: int = 0
+    # The last prose the run wrote, on every exit path. `answer` is for the person
+    # a top-level run reports to and stays empty for a subagent; this is for the
+    # program, so that a child that crashed, ran out of turns or was killed can
+    # still tell its parent how far it got.
+    last_text: str = ""
     error: str | None = None
     usage: object = None
     compactions: list = field(default_factory=list)
@@ -93,9 +100,12 @@ class Runner:
         max_turns: int = MAX_TURNS,
         depth: int = 0,
         seed: dict | None = None,
+        images=None,
+        audio=None,
         is_subagent: bool = False,
         budget: int | None = None,
         on_event=None,
+        link=None,
     ):
         self.task = task
         self.provider = provider or Provider(backend=backend, model=model,
@@ -104,7 +114,17 @@ class Runner:
         self.depth = depth
         self.is_subagent = is_subagent
         self.seed = seed
+        self.images: list[ImageAttachment] = normalize_images(images)
+        self.audio: list[AudioAttachment] = normalize_audio(audio)
         self.cwd = str(cwd or Path.cwd())
+        # The parent's end of this run, when there is a parent: its mailbox, its
+        # kill switch, and where to publish this run's kernel so a kill can
+        # interrupt the cell it is in the middle of. None at the top level, where
+        # the person watching talks to the harness instead. See spawn._Link.
+        self.link = link
+        # Delivered parent messages, counted so each one gets a cell id and a turn
+        # id of its own.
+        self._injected = 0
         self.on_event = on_event or (lambda *_a, **_k: None)
         if budget is not None and budget <= 0:
             raise ValueError(f"budget must be positive, got {budget}")
@@ -117,6 +137,8 @@ class Runner:
         self.store = ContextStore(
             task=task,
             system=system,
+            images=self.images,
+            audio=self.audio,
             replay_thinking=self.provider.backend.replay_thinking and bool(self.provider.thinking),
         )
         self.compressor = Compressor(self.provider, budget=self.budget)
@@ -189,8 +211,22 @@ class Runner:
             # which acquire() runs inside adopt() -- so the ordering the cold path
             # had is exactly preserved.
             self.kernel = pool.acquire(cwd=self.cwd, env=self._kernel_env())
+            if self.link is not None:
+                self.link.attach(self.kernel)
             self._emit("kernel_ready", depth=self.depth)
             result = self._loop()
+        except KeyboardInterrupt:
+            # Ctrl-C used to leave a traceback and nothing else: the turns, the
+            # cells and the paragraph the person had just watched being written
+            # all went with it. An interrupted run is a partial result, not a
+            # crash, and it is reported as one.
+            result = self._result or result
+            result.finish = "interrupted"
+            result.turns = len(self.store.cells)
+            result.error = f"interrupted at turn {result.turns}"
+            result.last_text = strip_trailing_done(self._last_text)
+            if not result.answer and not self.is_subagent:
+                result.answer = result.last_text
         except Exception as e:
             # Everything the loop had accumulated used to die with the exception:
             # `result` was still the empty one built above, so a run that fell over
@@ -201,6 +237,7 @@ class Runner:
             result.error = f"{type(e).__name__}: {e}"
             result.finish = "error"
             result.turns = len(self.store.cells)
+            result.last_text = strip_trailing_done(self._last_text)
             if not result.answer and not self.is_subagent:
                 # The prose from the last turn that wrote any is a partial answer
                 # the person watched being written; a crash is no reason to
@@ -247,6 +284,12 @@ class Runner:
         # The soft limit, raised a block at a time by _extend_turns().
         limit = self.max_turns
         for turn_no in range(1, self.max_turns * MAX_TURN_BLOCKS + 1):
+            # The top of a turn is the end of the one before it: the last turn's
+            # cells have run and nothing has been sampled yet. Checked here rather
+            # than at the bottom of the body because the body has half a dozen
+            # `continue`s in it, each of them the end of a turn too.
+            if self.link is not None and (stopped := self._boundary(result)):
+                return stopped
             if turn_no > limit:
                 limit = self._extend_turns(limit)
             # Announced before sampling, not after: on a long turn this header is
@@ -261,6 +304,12 @@ class Runner:
                        tokens=self.store.real_tokens)
             last_text = turn.text.strip() or last_text
             self._last_text = last_text
+
+            if self.link is not None and self.link.stopping:
+                # The kill landed while this turn was being generated. Its cells
+                # have not run yet, and running them is exactly what was asked to
+                # stop -- so the prose above is the last thing this run says.
+                return self._killed(result)
 
             finishing = turn.done and not self.is_subagent
             # Every `python` call the turn made, in order. More than one is a
@@ -412,6 +461,7 @@ class Runner:
                     # neither repeated nor attributed to a cell that came later.
                     thought=turn.text if i == 0 else "",
                     thinking_blocks=turn.thinking_blocks if i == 0 else [],
+                    images=output.images or [],
                     turn=turn_no,
                 )
                 # The status line is written after the cell exists so the accounting
@@ -498,6 +548,11 @@ class Runner:
         can offer it.
         """
         result.finish = finish
+        # Recorded on every path, both roles: `answer` is what a person reads and
+        # `last_text` is what a program is told. They diverge for a subagent, whose
+        # parent gets no paragraph but does need to know how far a run that
+        # produced no value had got.
+        result.last_text = strip_trailing_done(self._last_text)
         if self.is_subagent:
             # Its caller is a program, `value` is the whole of what crosses back,
             # and there is nobody at the other end to read a paragraph -- least of
@@ -546,6 +601,81 @@ class Runner:
             return ""
         self._emit("answer", text=turn.text)
         return turn.text.strip()
+
+    # --------------------------------------------------------------- the parent
+
+    def _boundary(self, result: RunResult) -> RunResult | None:
+        """Let the parent get a word in, between one turn and the next.
+
+        A subagent runs for as long as its job takes, so the parent has no wall
+        clock to intervene with -- it talks instead. Everything it has sent since
+        the last turn is delivered here, and a kill it asked for ends the run here
+        rather than at whatever happened to check next.
+        """
+        if self.link.stopping:
+            return self._killed(result)
+        for text in self.link.drain():
+            self._deliver(text)
+            if self.link.stopping:
+                # A kill queued behind the message it followed. Deliver nothing
+                # further; the run is over.
+                return self._killed(result)
+        return None
+
+    def _deliver(self, text: str) -> None:
+        """Hand the child its parent's message as a cell it genuinely ran.
+
+        Deliberately not a fabricated tool_use: the text goes into the kernel and
+        `inbox()` prints it, so what lands in the transcript is an ordinary REPL
+        block. It renders like every other cell, it survives compaction like every
+        other cell, and nothing downstream has to learn about a second kind of
+        message.
+        """
+        assert self.kernel is not None
+        self._injected += 1
+        try:
+            # A probe rather than a push: everywhere else a lost write costs a
+            # context refresh, and here it would show the model an empty inbox and
+            # drop the parent's message without saying so.
+            self.kernel.probe(f"import xagent.runtime as _r; _r._deliver({text!r})",
+                              timeout=30)
+        except Exception as e:
+            self._emit("warning", message=(f"a message from the parent could not be "
+                                           f"delivered ({type(e).__name__}: {e})"))
+            return
+        started = time.time()
+        output = self.kernel.execute("inbox()")
+        cell = self.store.add(
+            code="inbox()",
+            output=output.render(),
+            tool_use_id=f"tu_inbox_{self._injected}",
+            # A turn id no sampled turn can hold, so this is never folded into the
+            # assistant message of the turn beside it. The model did not ask for
+            # this cell and must not be shown as having asked for it.
+            turn=-self._injected,
+        )
+        cell.output += "\n\n" + self._status_line(time.time() - started)
+        if self._result is not None:
+            self._result.turns = len(self.store.cells)
+        self._emit("cell", n=cell.n, output=cell.output, ok=output.ok)
+
+    def _killed(self, result: RunResult) -> RunResult:
+        """End where the parent asked, keeping everything the run produced.
+
+        The same salvage as the crash path in run(): a child killed at turn forty
+        has forty turns of work and a paragraph behind it, and reporting the kill
+        with none of it is how a parent loses the only account of what its
+        subagent got to before it changed its mind.
+        """
+        reason = self.link.stop_reason
+        result.finish = "killed"
+        result.error = "killed by parent: " + (reason or "no reason given")
+        result.turns = len(self.store.cells)
+        result.last_text = strip_trailing_done(self._last_text)
+        if not self.is_subagent:
+            result.answer = result.answer or result.last_text
+        self._emit("note", message=f"stopped by the parent: {reason or 'no reason given'}")
+        return result
 
     # ----------------------------------------------------------------- helpers
 

@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 from xagent import config, runtime, spawn
@@ -562,6 +563,132 @@ def main() -> int:
         check("the notice names the limit that fired",
               "timed out after 0.5s" in out.render(), out.render())
         check("and points at the argument that raises it", "`timeout`" in out.render())
+
+        print("\nprovider: a malformed stream event killed a subagent 1.7s into its run")
+        # Seen live against SGLang: a `message_start` the SDK could not model-construct
+        # left `event.message` a plain dict, and its own accumulator then called
+        # `.to_dict()` on it. The subagent died with an AttributeError before it had
+        # done anything, which read as a bug in the harness rather than as weather.
+        import xagent.provider as provider_mod
+        from xagent.provider import _sdk_stream_fault
+
+        sdk_frame = compile("raise AttributeError(\"'dict' object has no attribute 'to_dict'\")",
+                            "/site-packages/anthropic/lib/streaming/_messages.py", "exec")
+
+        class _Stream:
+            def __init__(self, fail):
+                self.fail = fail
+
+            def __enter__(self):
+                if self.fail:
+                    exec(sdk_frame)
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_message(self):
+                return "final"
+
+        class _Messages:
+            def __init__(self, failures):
+                self.calls, self.failures = 0, failures
+
+            def stream(self, **kw):
+                self.calls += 1
+                return _Stream(self.calls <= self.failures)
+
+        class _Client:
+            def __init__(self, failures):
+                self.messages = _Messages(failures)
+
+        class _NoSleep:
+            monotonic = staticmethod(time.monotonic)
+            sleep = staticmethod(lambda _s: None)
+
+        try:
+            exec(sdk_frame)
+        except AttributeError as e:
+            check("a fault raised inside the SDK is recognised", _sdk_stream_fault(e))
+        try:
+            raise AttributeError("raised right here")
+        except AttributeError as e:
+            check("one raised in our own code is not", not _sdk_stream_fault(e))
+
+        real_time = provider_mod.time
+        provider_mod.time = _NoSleep
+        try:
+            prov = Provider(backend="codiv")
+            prov.client = _Client(failures=1)
+            check("a malformed stream event is retried, not fatal",
+                  prov._create(model="m") == "final")
+            check("and it took a second request to get there", prov.client.messages.calls == 2)
+
+            prov = Provider(backend="codiv")
+            prov.client = _Client(failures=9)
+            try:
+                prov._create(model="m")
+            except AttributeError:
+                check("a stream that never recovers still surfaces", True)
+            else:
+                check("a stream that never recovers still surfaces", False, "swallowed")
+
+            # An AttributeError from our own delta handling must arrive as itself,
+            # on the first attempt, rather than five retries later.
+            prov = Provider(backend="codiv")
+            prov.client = _Client(failures=0)
+            prov._relay = lambda event: (_ for _ in ()).throw(AttributeError("ours"))
+            hit = _Stream(False)
+            hit.__iter__ = lambda self=None: iter([object()])
+            calls_before = prov.client.messages.calls
+            try:
+                prov.client.messages.stream = lambda **kw: hit
+                prov._create(model="m")
+            except AttributeError as e:
+                check("our own AttributeError is not retried away", not _sdk_stream_fault(e))
+            else:
+                check("our own AttributeError is not retried away", True, "no fault raised")
+        finally:
+            provider_mod.time = real_time
+
+        print("\ncell timeout: a cell that swallowed the interrupt kept the harness")
+        print("              reading long after it had reported the cell as over")
+        # Measured at 15 minutes inside zmq_poll. The drain deadline was only
+        # consulted where the message queue ran dry, and a cell that goes on
+        # printing never lets it -- so the bound existed and was never reached.
+        import xagent.kernel as kernel_mod
+        from xagent.kernel import Kernel as _Kernel
+        grace = kernel_mod.DRAIN_GRACE
+        kernel_mod.DRAIN_GRACE = 1.0
+        stubborn = _Kernel(cwd=Path.cwd())
+        try:
+            started = time.monotonic()
+            out = stubborn.execute(
+                "import time\n"
+                "while True:\n"
+                "    try:\n"
+                "        print('still here')\n"
+                "        time.sleep(0.02)\n"
+                "    except KeyboardInterrupt:\n"
+                "        pass\n",
+                timeout=1,
+            )
+            took = time.monotonic() - started
+            check("the drain is a hard bound, not one checked only when idle",
+                  took < 8, f"{took:.1f}s")
+            check("the cell is still reported as timed out", out.timed_out)
+            check("and the harness knows the interrupt did not take", not out.stopped)
+            check("so the notice does not promise a quiescent namespace",
+                  "did not stop it" in out.render() and "namespace survived" not in out.render(),
+                  out.render()[:200])
+        finally:
+            kernel_mod.DRAIN_GRACE = grace
+            stubborn.shutdown()
+        check("a cell that does stop is still reported as stopped",
+              k.execute("1 + 1").stopped)
 
         print("\nprompt: constants quoted in prose must match the code")
         check("the cell-elision figure matches MAX_CODE_CHARS", str(MAX_CODE_CHARS) in SYSTEM,

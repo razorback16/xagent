@@ -18,9 +18,11 @@ from rich.text import Text
 from rich.theme import Theme
 
 from xagent import config
+from xagent.audio import AudioAttachment, AudioError, normalize_audio
 from xagent.kernel import strip_ansi
 from xagent.provider import Provider
 from xagent.runner import MAX_TURN_BLOCKS, MAX_TURNS, Runner
+from xagent.vision import normalize_images
 
 C = {
     "dim": "\033[2m", "bold": "\033[1m", "reset": "\033[0m",
@@ -426,6 +428,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("task", nargs="?", help="what the agent should do")
     parser.add_argument("-f", "--task-file", help="read the task from a file")
+    parser.add_argument("-i", "--image", action="append", dest="images", metavar="PATH",
+                        help="attach a local image (repeat for multiple images)")
+    parser.add_argument("-a", "--audio", action="append", dest="audio", metavar="PATH",
+                        help="attach an audio file as an analysis panel — waveform, "
+                             "spectrogram, level and level histogram (repeatable)")
+    parser.add_argument("--listen", type=float, default=None, metavar="SECONDS",
+                        help="record live audio for this long and attach it the same way")
+    parser.add_argument("--source", default="speaker", metavar="WHAT",
+                        help="what --listen records: speaker (whatever this machine "
+                             "is playing), mic, or a device name (default: speaker)")
     parser.add_argument("-p", "--provider", default=None,
                         choices=sorted(config.BACKENDS), help="which backend to use")
     parser.add_argument("-m", "--model", default=None, help="override the driver model")
@@ -448,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.budget is not None and args.budget <= 0:
         parser.error("--budget must be positive")
+    if args.listen is not None and args.listen <= 0:
+        parser.error("--listen must be a positive number of seconds")
 
     if args.task_file:
         task = Path(args.task_file).read_text()
@@ -455,6 +469,16 @@ def main(argv: list[str] | None = None) -> int:
         task = args.task
     else:
         parser.error("provide a task, or -f/--task-file")
+
+    try:
+        images = normalize_images(args.images)
+    except (OSError, ValueError) as e:
+        parser.error(str(e))
+
+    try:
+        audio = normalize_audio(args.audio)
+    except (OSError, ValueError, AudioError) as e:
+        parser.error(str(e))
 
     colour = not args.no_color and sys.stdout.isatty()
     c = paint(colour)
@@ -470,9 +494,24 @@ def main(argv: list[str] | None = None) -> int:
             "dim"))
     print(c(f"cwd {args.cwd or Path.cwd()}", "dim"))
 
+    if args.listen:
+        from xagent import capture
+
+        try:
+            source = capture.resolve(args.source)
+            print(c(f"● recording {source.kind} ({source.device}) for "
+                    f"{args.listen:g}s via {source.tool}…", "dim"))
+            audio.append(AudioAttachment.from_clip(capture.record(source, args.listen)))
+        except AudioError as e:
+            print(c(f"! {e}", "yellow"))
+    for clip in audio:
+        print(c(f"♪ {clip.summary()}", "dim"))
+
     runner = Runner(
         task,
         provider=provider,
+        images=images,
+        audio=audio,
         cwd=args.cwd,
         max_turns=args.max_turns,
         budget=args.budget,

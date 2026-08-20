@@ -18,6 +18,17 @@ dependencies = [
     "rich>=15.0.0",
 ]
 
+# Analysing and drawing audio needs nothing beyond the standard library (and
+# ffmpeg on PATH for compressed formats). Only local transcription is heavy, so
+# it is an extra rather than a dependency.
+[project.optional-dependencies]
+asr = [
+    "torch>=2.6",
+    "transformers>=5.13",
+    "accelerate>=1.0",
+    "bitsandbytes>=0.47",
+]
+
 [project.scripts]
 xagent = "xagent.cli:main"
 
