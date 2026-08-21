@@ -66,7 +66,7 @@ def main() -> int:
     )
     try:
         seen = vision_provider.sample(
-            vision_store.system, vision_store.messages(), tools=False).text.strip()
+            vision_store.system, vision_store.messages()).text.strip()
     except Exception as e:
         seen = f"{type(e).__name__}: {e}"
     check("provider reads an attached image", "blue" in seen.lower(), seen[:300])

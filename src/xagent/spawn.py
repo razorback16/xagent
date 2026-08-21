@@ -108,7 +108,17 @@ class _Link:
     nothing to serialize: a message is an append, a kill is an Event. Every field
     is written by the child's thread and read from the parent's cell, so all of it
     moves under one lock.
+
+    This is also the Runner's message channel (see `Runner.channel`), which is what
+    makes a parent's `send()` and a person typing at the terminal the same mechanism
+    at the other end. The two constants below are the only place the two differ.
     """
+
+    # How a stop is reported. A parent changing its mind is a kill; the person at
+    # the terminal pressing Esc is not, and the words a model reads should not say
+    # it was.
+    stop_label = "killed by parent"
+    stop_finish = "killed"
 
     def __init__(self, label: str):
         self.label = label
@@ -174,6 +184,14 @@ class _Link:
             pending, self._messages = self._messages, []
         return pending
 
+    def resume(self) -> None:
+        """Clear a stop. Never used by a subagent -- a kill is final for a child --
+        but part of the channel protocol, because the person at the terminal
+        interrupts a response and then keeps the session."""
+        self._stop.clear()
+        with self._lock:
+            self.stop_reason = ""
+
     def attach(self, kernel) -> None:
         with self._lock:
             self.kernel = kernel
@@ -187,11 +205,10 @@ class _Link:
         """The run's own final numbers, filling gaps the event stream left.
 
         `turns` never overwrites a count the events already produced. A RunResult
-        counts *cells*, and a child its parent messaged has an injected inbox()
-        cell per message, so taking its number at the end made poll()'s turn
-        column jump the moment the child finished. It is still the fallback for a
-        run that emitted no events at all, which is the only case where it is the
-        better of the two.
+        counts *cells*, and the two are not the same number, so taking its figure at
+        the end made poll()'s turn column jump the moment the child finished. It is
+        still the fallback for a run that emitted no events at all, which is the
+        only case where it is the better of the two.
         """
         with self._lock:
             if turns and not self.turns:
@@ -307,7 +324,7 @@ class Handle:
             return f"[send] {self.label!r} has already finished; nothing was queued."
         waiting = self._link.post(text)
         return (f"[send] queued for {self.label!r} ({waiting} waiting) — it arrives "
-                f"as an inbox() cell at the end of its current turn.")
+                f"as a message from you at the end of its current turn.")
 
     def kill(self, reason: str = "") -> str:
         """Stop this subagent. Ends at its current cell, keeping what it produced."""
@@ -472,7 +489,7 @@ def _work(link: _Link, prompt: str, seed, model, max_turns, thinking, sampling):
             seed=seed,
             is_subagent=True,
             on_event=link.on_event,
-            link=link,
+            channel=link,
         ).run()
     except BaseException:
         link.finish("failed")

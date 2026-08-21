@@ -15,6 +15,7 @@ dependencies = [
     "httpx>=0.28.1",
     "ipykernel>=7.3.0",
     "jupyter-client>=8.9.1",
+    "prompt-toolkit>=3.0.52",
     "rich>=15.0.0",
 ]
 
@@ -35,3 +36,7 @@ xagent = "xagent.cli:main"
 [build-system]
 requires = ["uv_build>=0.10.2,<0.11.0"]
 build-backend = "uv_build"
+
+[[tool.uv.index]]
+url = "https://pypi.apple.com/simple"
+default = true

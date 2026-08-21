@@ -22,7 +22,7 @@ from xagent.context import MAX_CODE_CHARS, ContextStore
 from xagent.kernel import Kernel, _ControlSplitter
 from xagent.runtime import CTL_BEGIN, CTL_END
 from xagent.prompts import SUBAGENT_CODA, SYSTEM, SYSTEM_SUBAGENT
-from xagent.provider import (DONE_TOOL, PYTHON_TOOL, PYTHON_TOOL_SUBAGENT,
+from xagent.provider import (PYTHON_TOOL, PYTHON_TOOL_SUBAGENT,
                              Provider, Usage)
 from xagent.runner import DONE_EXPR, RunResult, Runner
 
@@ -321,7 +321,7 @@ def main() -> int:
             def __init__(self, blocks):
                 self.content = blocks
 
-        def _prov(offer_done=True):
+        def _prov(is_subagent=False):
             prov = Provider.__new__(Provider)
             prov.usage = Usage()
             prov.calls = 0
@@ -331,11 +331,11 @@ def main() -> int:
             prov.model = "m"
             prov.thinking = None
             prov.sampling = "thinking"
-            prov.offer_done = offer_done
+            prov.is_subagent = is_subagent
             return prov
 
-        def assemble(blocks, offer_done=True):
-            prov = _prov(offer_done)
+        def assemble(blocks, is_subagent=False):
+            prov = _prov(is_subagent)
             prov._create = lambda **kw: _Resp(blocks)
             return prov._sample_once("sys", [], 1024)
 
@@ -385,10 +385,11 @@ def main() -> int:
               str([c.timeout for c in turn.calls]))
 
         turn = assemble([py, _Block("done", "tu_d", None), py2])
-        check("a finish beside a batch keeps every call in it",
-              turn.done and [c.code for c in turn.calls] == ["x = 1", "y = 2"],
-              f"done={turn.done} calls={[c.code for c in turn.calls]}")
-        turn = assemble([py, py2], offer_done=False)
+        check("a `done` block beside a batch keeps every call in it, and is a stray",
+              turn.ignored_tools == ["done"]
+              and [c.code for c in turn.calls] == ["x = 1", "y = 2"],
+              f"ignored={turn.ignored_tools} calls={[c.code for c in turn.calls]}")
+        turn = assemble([py, py2], is_subagent=True)
         check("a subagent batches the same way",
               [c.code for c in turn.calls] == ["x = 1", "y = 2"],
               str([c.code for c in turn.calls]))
@@ -397,24 +398,19 @@ def main() -> int:
         print("        the chat template renders inside the <tools> block")
         DESC = PYTHON_TOOL["description"]
         SUB_DESC = PYTHON_TOOL_SUBAGENT["description"]
-        check("the description names the two tools the top level has",
-              "This and `done` are the only tools that exist" in DESC, DESC[:200])
-        check("the subagent's names `python` as its only one",
+        check("the description names python as the only tool the top level has",
+              "only tool that exists" in DESC, DESC[:200])
+        check("and says there is no tool for finishing either",
+              "no tool for finishing" in DESC, DESC[:300])
+        check("the subagent's names `python` as its only one too",
               "only tool that exists" in SUB_DESC, SUB_DESC[:200])
         check("it says the helpers are functions, not tools", "not tools" in DESC)
         check("it warns that any other tool name wastes the turn",
-              "other than `python` or `done` runs nothing" in DESC)
+              "other than `python` runs nothing" in DESC)
         check("and the subagent's warns about anything but python",
               "other than `python` runs nothing" in SUB_DESC)
-        check("the finish tool takes no input at all",
-              DONE_TOOL["input_schema"]["properties"] == {}
-              and not DONE_TOOL["input_schema"].get("required"),
-              str(DONE_TOOL["input_schema"]))
-        check("and says where the answer actually goes",
-              "the text is the answer" in DONE_TOOL["description"],
-              DONE_TOOL["description"][:200])
-        check("it says a cell in the same turn runs first",
-              "runs first" in DONE_TOOL["description"], DONE_TOOL["description"])
+        check("the top level is told a turn with no call is the answer",
+              "no `python` call is the answer" in DESC, DESC[-400:])
         check("the prompt does not restate the contract at length",
               "How a cell runs" not in SYSTEM)
         check("no heading offers the helpers as tools", "Tools available" not in SYSTEM)
@@ -475,66 +471,65 @@ def main() -> int:
 
         print("\nprompt: the answer to a person was a done() value, so a dict repr")
         print("        reached the terminal where sentences belonged")
-        fin = SYSTEM.split("# Finishing")[-1]
+        fin = SYSTEM.split("# Answering")[-1]
         flat = " ".join(fin.split())
-        check("the top-level agent is told the call takes nothing",
-              "It takes no input" in flat, flat[:400])
-        check("the prompt puts the answer beside the call, not inside it",
-              "The text is the answer" in flat and "ordinary text" in flat, flat[:400])
+        check("the top-level agent is told a turn with no call is the answer",
+              "no tool call in that turn" in flat, flat[:400])
+        check("and that a turn with a call is it still working",
+              "still working" in flat and "handing back" in flat, flat[:400])
         check("it rules out handing a person a data structure",
               "not an answer to a person" in flat)
-        check("it says what finishing silently costs",
-              "turn with no tool in it" in flat, flat[:600])
-        check("the coda tells a subagent there is no such turn",
+        check("it says the person may reply, so this is not a one-shot",
+              "they will reply if there is more" in flat, flat[:800])
+        check("and that the kernel survives the answer, so a reply resumes",
+              "every variable still bound" in flat, flat[:800])
+        check("the coda tells a subagent there is no turn after its done()",
               "no turn after your" in SUBAGENT_CODA, SUBAGENT_CODA[-400:])
-        check("the prompt names the finish as a tool, not as code to send",
-              "call `done` in that same turn" in flat, flat[:400])
-        check("and tells the model not to type it into the answer",
+        check("no finish tool is described to the top level",
+              "`done` tool" not in flat, flat[:400])
+        check("and tells the model not to type done() into the answer",
               "Never type `done()` into the answer" in flat, flat[:600])
         check("and never as a block the model can echo into its answer",
               "\n    done()\n" not in SYSTEM,
               "a standalone done() block invites the model to type it into the prose")
-        subfin = " ".join(SYSTEM_SUBAGENT.split("# Finishing")[-1].split())
+        subfin = " ".join(SYSTEM_SUBAGENT.split("# Finishing")[-1].split())  # noqa
         check("the subagent's prompt sends done(value) as Python instead",
               "one more line of code in the `python` tool" in subfin, subfin[:400])
         check("and explains that naming a value beats transcribing it",
               "not the capped view" in subfin, subfin[:600])
         rendered = k.execute("done()").render()
-        check("a top-level done() redirects to the tool rather than finishing",
-              "`done` tool" in rendered and "does not finish" in rendered, rendered[:250])
+        check("a top-level done() redirects rather than ending the response",
+              "no tool call" in rendered and "does not end your response" in rendered,
+              rendered[:250])
         check("passing a value anyway is answered, not silently kept",
               "read by nobody" in k.execute("done({'n': 1})").render())
-        check("the ask for a missing answer lives on the path that needs it",
-              "no answer written" in inspect.getsource(Runner._answer))
         rendered = sub.execute("done({'n': 1})").render()
         check("a subagent's done() reports the value it hands back",
-              "'n': 1" in rendered and "does not finish" not in rendered, rendered[:200])
-        check("sample() can withhold the tools for that turn",
-              "tools" in inspect.signature(Provider.sample).parameters)
+              "'n': 1" in rendered and "does not end" not in rendered, rendered[:200])
         check("the result carries the prose separately from the value",
               "answer" in {f.name for f in dataclasses.fields(RunResult)})
 
-        print("\nfinishing: a `done` tool call cost a turn to correct, which left the")
-        print("           answer stranded one turn away from the call that ended the run")
+        print("\nfinishing: the `done` tool cost a turn to correct whenever a model")
+        print("           narrated it, so there is no such tool at either depth now")
         dn = _Block("done", "tu_d", None)
-        turn = assemble([py, dn], offer_done=True)
-        check("the finish is extracted, not made to compete with the cell",
-              turn.done and turn.done_id == "tu_d" and turn.code == "x = 1",
-              f"done={turn.done} code={turn.code!r}")
-        check("and is never reported back as a stray", turn.ignored_tools == [],
-              str(turn.ignored_tools))
-        turn = assemble([dn], offer_done=True)
-        check("a finish arriving alone leaves no call to act on",
-              turn.done and turn.tool_use_id is None, str(turn.tool_use_id))
-        turn = assemble([py, dn], offer_done=False)
-        check("a subagent is offered no such tool, so its `done` block is a stray",
-              not turn.done and turn.ignored_tools == ["done"], str(turn.ignored_tools))
-        check("the two roles are handed different tool sets",
-              [t["name"] for t in _prov(True)._tools()] == ["python", "done"]
-              and [t["name"] for t in _prov(False)._tools()] == ["python"])
-        check("a lone finish is not mistaken for a truncated turn",
-              "turn.tool_use_id or turn.done" in inspect.getsource(Provider.sample))
-        check("prose from a refused turn is carried to the finish after it",
+        turn = assemble([py, dn])
+        check("a `done` block never competes with the cell beside it",
+              turn.code == "x = 1" and turn.ignored_tools == ["done"],
+              f"code={turn.code!r} ignored={turn.ignored_tools}")
+        turn = assemble([dn])
+        check("a lone `done` block is promoted so there is an id to answer",
+              turn.tool_name == "done" and turn.tool_use_id == "tu_d",
+              str(turn.tool_use_id))
+        check("neither role is offered anything but python",
+              [t["name"] for t in _prov(False)._tools()] == ["python"]
+              and [t["name"] for t in _prov(True)._tools()] == ["python"])
+        check("but the two roles get different descriptions of it",
+              _prov(False)._tools()[0] is PYTHON_TOOL
+              and _prov(True)._tools()[0] is PYTHON_TOOL_SUBAGENT)
+        check("a turn is produced when it has a call or text, so an answer counts",
+              "turn.tool_use_id or turn.text.strip()"
+              in inspect.getsource(Provider.sample))
+        check("prose from a refused turn is carried to the turn that ends after it",
               "carried, stranded = stranded" in inspect.getsource(Runner._loop))
 
         print("\ncell timeout: a fixed 180s wall meant a slow build could only")

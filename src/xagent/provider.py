@@ -67,22 +67,25 @@ _PYTHON_SCHEMA = {
 PYTHON_TOOL = {
     "name": "python",
     "description": (
-        "Run Python in a persistent IPython kernel. This and `done` are the only "
-        "tools that exist -- there is no shell tool and no file tool. Everything "
-        "you do, you do by writing Python here.\n\n"
+        "Run Python in a persistent IPython kernel. This is the only tool that "
+        "exists -- there is no shell tool, no file tool, no tool for finishing. "
+        "Everything you do, you do by writing Python here.\n\n"
         + _PYTHON_BODY +
         "The namespace already holds the helpers you reach for most -- files, "
         "search, shell, subagents, context control -- plus the whole Python "
         "standard library. Those are ordinary functions, not tools: write "
         "`sh(\"git status\")` as code inside `code`. A tool call by any name "
-        "other than `python` or `done` runs nothing and wastes the turn."
+        "other than `python` runs nothing and wastes the turn.\n\n"
+        "To end your response, write your answer as ordinary text and make no call "
+        "at all. A turn with no `python` call is the answer, and the person you "
+        "work for reads it and may reply."
     ),
     "input_schema": _PYTHON_SCHEMA,
 }
 
 # A subagent finishes by value, from inside the kernel, so for it `done` really is
 # a function and really is not a tool -- the contract this description has always
-# stated. It keeps that text; only the top level's changed.
+# stated.
 PYTHON_TOOL_SUBAGENT = {
     "name": "python",
     "description": (
@@ -99,24 +102,6 @@ PYTHON_TOOL_SUBAGENT = {
         "more line of Python in this tool, never as a tool call of its own."
     ),
     "input_schema": _PYTHON_SCHEMA,
-}
-
-# Offered to the top-level agent only. It takes no input at all, which is the whole
-# reason it can be a tool: the answer is prose the model has to write out anyway,
-# so there is no value for an argument to carry -- unlike a subagent's result,
-# which lives in its kernel and would have to be transcribed to fit in one.
-DONE_TOOL = {
-    "name": "done",
-    "description": (
-        "End the run. Call it in the same turn as your final answer, which you "
-        "write as ordinary text beside this call: the text is the answer, and "
-        "this call is only the full stop after it. It takes no input -- there is "
-        "nothing to pass, and anything you would put here is an answer you should "
-        "have written as text. If you send a `python` call in the same turn, that "
-        "code runs first and the run ends after it. Call this only when the work "
-        "is genuinely finished; if a step failed, investigate instead."
-    ),
-    "input_schema": {"type": "object", "properties": {}},
 }
 
 
@@ -197,11 +182,6 @@ class Turn:
     timeout: float | None = None
     tool_use_id: str | None = None
     tool_name: str | None = None
-    # The top-level finish. Set when a `done` tool block arrived; it is extracted
-    # rather than treated as a call to act on, so it never competes with the
-    # `python` calls beside it and never lands in `ignored_tools`.
-    done: bool = False
-    done_id: str | None = None
     # Names of any further tool_use blocks in the same turn that were not acted
     # on, so the caller can correct the model without discarding what it did.
     ignored_tools: list[str] = field(default_factory=list)
@@ -271,9 +251,9 @@ class Provider:
         self.thinking = config.resolve_thinking(thinking)
         self.sampling = sampling or config.DEFAULT_SAMPLING
         self.client = anthropic.Anthropic(**config.client_kwargs(self.backend))
-        # Set by Runner to the role: the top level is offered `done` as a tool, a
-        # subagent is not (it finishes by value, from inside its kernel).
-        self.offer_done = True
+        # Set by Runner to the role. It decides which rendering of the python tool
+        # description goes out: only a subagent is told about in-kernel `done`.
+        self.is_subagent = False
         self.usage = Usage()
         self.calls = 0
         self.truncated_turns = 0
@@ -454,24 +434,20 @@ class Provider:
 
     # ------------------------------------------------------------------- sample
 
-    def sample(self, system: str, messages: list[dict], *, tools: bool = True) -> Turn:
+    def sample(self, system: str, messages: list[dict]) -> Turn:
         """Sample one turn, retrying a turn that reasoned itself out of room.
 
         A reasoning model can spend its whole output budget thinking and stop before
         emitting the tool call. That is not the model declining to act, so widen the
         budget and ask again rather than treating it as the end of the run.
 
-        `tools=False` withholds the tool for the final answer turn, where the
-        deliverable is prose. The same retry applies, against text rather than a
-        tool call: an answer that never arrived is the same failure.
+        A turn with no tool call but text in it is the response ending, so the check
+        below accepts either: what makes a turn empty is producing neither.
         """
         budget = self._clamp(self._budget(), system, messages)
         for _ in range(3):
-            turn = self._sample_once(system, messages, budget, tools=tools)
-            # A lone `done` call is a produced turn: the model acted, it simply
-            # acted by finishing. Reading it as truncation would re-ask, at full
-            # price, for a turn that already said everything it meant to.
-            produced = (turn.tool_use_id or turn.done) if tools else turn.text.strip()
+            turn = self._sample_once(system, messages, budget)
+            produced = turn.tool_use_id or turn.text.strip()
             if produced or turn.stop_reason != "max_tokens":
                 return turn
             wider = self._clamp(budget * 2, system, messages)
@@ -485,12 +461,9 @@ class Provider:
         return turn
 
     def _tools(self) -> list[dict]:
-        if self.offer_done:
-            return [PYTHON_TOOL, DONE_TOOL]
-        return [PYTHON_TOOL_SUBAGENT]
+        return [PYTHON_TOOL_SUBAGENT if self.is_subagent else PYTHON_TOOL]
 
-    def _sample_once(self, system: str, messages: list[dict], budget: int,
-                     *, tools: bool = True) -> Turn:
+    def _sample_once(self, system: str, messages: list[dict], budget: int) -> Turn:
         self._code_seen = ""
         params, extra = self._sampling_kw()
         thinking = self._thinking_kw()
@@ -504,7 +477,7 @@ class Provider:
             max_tokens=budget,
             system=self.system_blocks(system),
             messages=messages,
-            tools=self._tools() if tools else anthropic.NOT_GIVEN,
+            tools=self._tools(),
             extra_body=extra,
             **params,
             **thinking,
@@ -531,19 +504,6 @@ class Provider:
                 turn.thinking_blocks.append(block.model_dump(exclude_none=True))
             elif block.type == "tool_use":
                 tool_blocks.append(block)
-
-        # The finish is extracted before anything competes for the acted-on slot.
-        # It is not a call to run: it is the turn saying it is the last one, and a
-        # `python` block beside it still deserves to run. Only the top level is
-        # offered it; for a subagent a `done` block is a stray like any other, and
-        # falls through to the correction below -- guessing at the value it meant
-        # to return would fabricate the subagent's whole result.
-        if self.offer_done:
-            finish = next((b for b in tool_blocks if b.name == "done"), None)
-            if finish is not None:
-                turn.done = True
-                turn.done_id = finish.id
-                tool_blocks = [b for b in tool_blocks if b is not finish]
 
         # Every `python` block in the turn is a call to run, wherever it sits.
         # There is nothing a REPL has to do to support that: the cells run in

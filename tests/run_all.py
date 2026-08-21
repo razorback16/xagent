@@ -22,6 +22,7 @@ SUITES = [
     ("test_audio", False),
     ("test_regressions", False),
     ("test_finishing", False),
+    ("test_session", False),
     ("test_subagents", False),
     ("test_pool", False),
     ("test_compaction", True),

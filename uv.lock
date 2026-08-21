@@ -1711,6 +1711,7 @@ dependencies = [
     { name = "httpx" },
     { name = "ipykernel" },
     { name = "jupyter-client" },
+    { name = "prompt-toolkit" },
     { name = "rich" },
 ]
 
@@ -1732,6 +1733,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "ipykernel", specifier = ">=7.3.0" },
     { name = "jupyter-client", specifier = ">=8.9.1" },
+    { name = "prompt-toolkit", specifier = ">=3.0.52" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "torch", marker = "extra == 'asr'", specifier = ">=2.6" },
     { name = "transformers", marker = "extra == 'asr'", specifier = ">=5.13" },

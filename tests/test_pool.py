@@ -110,7 +110,7 @@ def main() -> int:
         check("so nothing of the previous run is bound",
               "NameError" in k.execute("seeded_value").render())
         check("and a top-level kernel's done() only redirects",
-              "`done` tool" in k.execute("done()").render(),
+              "does not end your response" in k.execute("done()").render(),
               k.execute("done()").render()[:120])
     finally:
         k.shutdown()

@@ -45,6 +45,7 @@ os.environ["XAGENT_KERNEL_POOL"] = "0"
 import xagent.runner as runner_module  # noqa: E402
 from xagent import config, runtime, spawn  # noqa: E402
 from xagent.kernel import Kernel  # noqa: E402
+from xagent.prompts import SUBAGENT_CODA  # noqa: E402
 from xagent.provider import Call, Turn, Usage  # noqa: E402
 from xagent.runner import RunResult  # noqa: E402
 from xagent.runner import Runner as RealRunner  # noqa: E402
@@ -101,7 +102,7 @@ class StubProvider:
         self.backend = config.BACKENDS["codiv"]
         self.model, self.thinking, self.sampling = "stub", None, "thinking"
         self.usage, self.on_delta, self.truncated_turns = Usage(), None, 0
-        self.offer_done = True
+        self.is_subagent = False
         # Set to the runner's store by `child()`, so every request can record what
         # the transcript held at the moment it went out. That is how "delivered
         # before the first sample" is asserted rather than timed.
@@ -161,7 +162,7 @@ def child(task: str, turns, executor: ThreadPoolExecutor, label: str | None = No
     link = link if link is not None else spawn._Link(label or task)
     provider = StubProvider(turns)
     runner = RealRunner(task, provider=provider, is_subagent=True,
-                        on_event=link.on_event, link=link)
+                        on_event=link.on_event, channel=link)
     provider.store = runner.store
     _PREPARED[task] = runner
     future = executor.submit(spawn._work, link, task, None, None, 8, None, None)
@@ -424,7 +425,7 @@ def messaging_unit() -> None:
         said = h.send("switch to plan B")
         check("send() reports the queue depth", "(1 waiting)" in said, said)
         check("and says when it will arrive",
-              "inbox() cell at the end of its current turn" in said, said)
+              "message from you at the end of its current turn" in said, said)
         check("it is one line, because it lands in a context window",
               "\n" not in said and len(said) < 200, repr(said))
         check("the count moves", h.messages_sent == 1, str(h.messages_sent))
@@ -457,7 +458,7 @@ def messaging_unit() -> None:
 
 
 def messaging_live(ex: ThreadPoolExecutor) -> None:
-    print("a message becomes a cell the child genuinely ran")
+    print("a message becomes a real user message in the child's conversation")
     task = "audit the parser"
     mid = "stop auditing, just count the files"
     link = spawn._Link("auditor")
@@ -478,60 +479,45 @@ def messaging_live(ex: ThreadPoolExecutor) -> None:
                work("done({'files': 3})", "finished")], ex, label="auditor", link=link)
     run = handle._future.result(timeout=PATIENCE)
 
-    cells = runner.store.cells
-    inbox = [c for c in cells if c.code == "inbox()"]
-    codes = [c.code for c in cells]
-    check("every message arrived as a cell of its own", len(inbox) == 3, str(codes))
-    check("the two queued before the run started arrived first",
-          codes[:2] == ["inbox()", "inbox()"], str(codes))
-    check("before the model was sampled even once",
-          provider.seen[0] == ["inbox()", "inbox()"], str(provider.seen[0]))
-    check("the one sent mid-run arrived at the end of that turn, not inside it",
-          codes[:5] == ["inbox()", "inbox()", "a = 1", "b = 2", "inbox()"], str(codes))
-    check("so the turn it interrupted still ran its own cell first",
-          codes.index("b = 2") < codes.index("inbox()", 2), str(codes))
-    check("it carries the parent's words verbatim", mid in inbox[2].output,
-          inbox[2].output[:200])
+    marks = runner.store.marks
+    codes = [c.code for c in runner.store.cells]
+    check("every message arrived as a mark of its own", len(marks) == 3,
+          f"{len(marks)} marks, cells={codes}")
+    check("and not as a cell the child never wrote", "inbox()" not in codes, str(codes))
+    check("each is a user message, which is what somebody talking is",
+          all(m.role == "user" for m in marks), str([m.role for m in marks]))
     check("labelled as the parent talking, so the model knows who it is",
-          "from the parent that spawned you" in inbox[2].output, inbox[2].output[:120])
+          all(m.tag == "message-from-parent" for m in marks),
+          str([m.tag for m in marks]))
+    check("it carries the parent's words verbatim", marks[2].text == mid,
+          repr(marks[2].text))
+    check("the two queued before the run started arrived before any cell ran",
+          [m.after for m in marks[:2]] == [0, 0], str([m.after for m in marks]))
+    check("the one sent mid-run landed after the cell of the turn it arrived in",
+          marks[2].after == 2, f"after={marks[2].after} cells={codes}")
+    check("so the turn it interrupted still ran its own cell first",
+          codes[:2] == ["a = 1", "b = 2"], str(codes))
     check("each message was delivered exactly once",
-          sum(mid in c.output for c in cells) == 1, str(codes))
+          sum(m.text == mid for m in marks) == 1, str([m.text for m in marks]))
     check("and the mailbox is empty afterwards", link.drain() == [])
-
-    footer = inbox[2].output.splitlines()[-1]
-    check("the cell carries the usual status-line footer",
-          footer.startswith("[") and footer.endswith("]"), repr(footer))
-    for field in ("cell ", "run ", "ctx "):
-        check(f"the footer reports {field.strip()}, like every other cell",
-              field in footer, repr(footer))
-
-    turns = [c.turn for c in inbox]
-    others = {c.turn for c in cells if c.code != "inbox()"}
-    check("its turn id is one no sampled turn can hold", all(t < 0 for t in turns),
-          str(turns))
-    check("so it cannot be folded into the assistant message beside it",
-          not (set(turns) & others), f"{turns} vs {sorted(others)}")
-    check("and no two injected cells share one either", len(set(turns)) == 3, str(turns))
-    check("each gets a tool_use_id of its own",
-          len({c.tool_use_id for c in inbox}) == 3,
-          str([c.tool_use_id for c in inbox]))
 
     msgs = runner.store.messages()
     faults = conversation_faults(msgs)
     check("the transcript still renders as a valid conversation", not faults,
           "; ".join(faults))
     check("with the message in it", mid in str(msgs))
-    injected = [m for m in msgs if m["role"] == "assistant"
-                and any(b.get("input", {}).get("code") == "inbox()"
-                        for b in m["content"] if b.get("type") == "tool_use")]
-    check("each injected cell is an assistant message of its own",
-          len(injected) == 3, str(len(injected)))
-    check("holding nothing but the one call the model never asked for",
-          all([b["type"] for b in m["content"]] == ["tool_use"] for m in injected),
-          str([[b["type"] for b in m["content"]] for m in injected]))
-    check("and it is attributed to `python`, the only tool the child has",
+    said = " ".join(b.get("text", "") for m in msgs for b in m["content"])
+    check("wrapped in the tag the model is told to read it by",
+          f"<message-from-parent>\n{mid}\n</message-from-parent>" in said, said[:300])
+    check("the two posted before the run ride the opening user message",
+          msgs[0]["role"] == "user"
+          and "read the README first" in str(msgs[0]["content"]), str(msgs[0])[:300])
+    check("every tool_use in the transcript is still `python`",
           all(b["name"] == "python" for m in msgs if m["role"] == "assistant"
               for b in m["content"] if b.get("type") == "tool_use"), "")
+    check("and no assistant message claims the child asked to be messaged",
+          "message-from-parent" not in str([m for m in msgs
+                                            if m["role"] == "assistant"]), "")
 
     check("the run itself is untouched by any of it",
           run.finish == "done" and run.value == {"files": 3},
@@ -542,37 +528,19 @@ def messaging_live(ex: ThreadPoolExecutor) -> None:
           handle.messages_sent == 3, str(handle.messages_sent))
 
 
-def inbox_in_kernel() -> None:
-    print("\ninbox() in a real kernel: read once, and empty after")
-    kernel = Kernel(cwd=os.getcwd(), env={**os.environ, "XAGENT_ROLE": "subagent"})
-    try:
-        out = kernel.execute("inbox()").render()
-        check("a subagent with no mail is told so plainly",
-              "no messages from your parent" in out, out[:160])
-        kernel.probe("import xagent.runtime as _r; "
-                     "_r._deliver('alpha'); _r._deliver('beta')")
-        out = kernel.execute("inbox()").render()
-        check("both queued messages are printed", "alpha" in out and "beta" in out,
-              out[:200])
-        check("counted, so a model can tell one from three",
-              "2 message(s)" in out, out[:120])
-        out = kernel.execute("inbox()").render()
-        check("reading clears the mailbox", "no messages" in out, out[:160])
-        check("the queue itself is empty, not merely unprinted",
-              kernel.probe("import xagent.runtime as _r; "
-                           "print(_r._STATE['inbox'])").strip() == "[]", "")
-        out = kernel.execute("import os; os.environ['XAGENT_ROLE'] = 'top'\ninbox()"
-                             ).render()
-        check("at the top level it says nothing sends here, rather than erroring",
-              "nothing sends here" in out and "top-level agent" in out, out[:200])
-        check("and points at the person who does talk to it",
-              "talks to you through the task" in out, out[:200])
-        out = kernel.execute("import xagent.runtime as _r; "
-                             "_r._deliver('ignored'); inbox()").render()
-        check("a message that arrives at the top level is not printed as one",
-              "ignored" not in out, out[:200])
-    finally:
-        kernel.shutdown()
+def no_inbox_left() -> None:
+    print("\ninbox() is gone: a message is a message, not a cell to run")
+    check("it is not in the model-facing namespace",
+          not any(getattr(o, "__name__", "") == "inbox" for o in runtime.PUBLIC),
+          str([getattr(o, "__name__", "") for o in runtime.PUBLIC]))
+    check("nor is it defined at all", not hasattr(runtime, "inbox"))
+    check("and nothing pushes a message into a kernel any more",
+          not hasattr(runtime, "_deliver"))
+    check("the subagent prompt describes a message instead of a cell",
+          "<message-from-parent>" in SUBAGENT_CODA
+          and "inbox()" not in SUBAGENT_CODA, "")
+    check("and says it outranks the task the parent spawned it with",
+          "outranks the task" in SUBAGENT_CODA, "")
 
 
 def killing(ex: ThreadPoolExecutor) -> None:
@@ -781,10 +749,9 @@ def progress(ex: ThreadPoolExecutor) -> None:
         ex2.shutdown(wait=True)
 
     print("\nthe turn a parent is shown is a turn, not a cell count")
-    # RunResult.turns counts cells, and a child its parent messaged has an injected
-    # inbox() cell per message on top of its own. Taking that number at the end
-    # made poll()'s turn column jump the moment the child finished, and reported a
-    # kill as landing at a turn that never happened.
+    # RunResult.turns counts cells, which is not the same number. Taking it at the
+    # end made poll()'s turn column jump the moment the child finished, and reported
+    # a kill as landing at a turn that never happened.
     counted = spawn._Link("counted")
     counted.begin()
     for n in (1, 2, 3):
@@ -945,8 +912,8 @@ def non_regression(ex: ThreadPoolExecutor) -> None:
           str([c.code for c in runner.store.cells]))
     check("the transcript is valid", not conversation_faults(runner.store.messages()),
           "; ".join(conversation_faults(runner.store.messages())))
-    check("a subagent is never offered the `done` tool",
-          provider.offer_done is False, repr(provider.offer_done))
+    check("a subagent gets the subagent rendering of the python tool",
+          provider.is_subagent is True, repr(provider.is_subagent))
     check("gathering the same handle twice gives the same value",
           runtime.gather([handle, handle]) == [{"n": 50}, {"n": 50}], "")
     check("and the handle reads done", handle.state == "done" and handle.done)
@@ -966,7 +933,7 @@ def non_regression(ex: ThreadPoolExecutor) -> None:
     check("and it is in the namespace the model programs against",
           AgentError in runtime.PUBLIC)
     for tool in (runtime.gather, runtime.poll, runtime.send, runtime.kill,
-                 runtime.inbox, runtime.agent):
+                 runtime.agent):
         check(f"{tool.__name__}() is offered to the model", tool in runtime.PUBLIC)
     check("the docstring the model reads says there is no wall clock",
           "no wall clock" in (runtime.agent.__doc__ or ""), "")
@@ -991,7 +958,7 @@ def main() -> int:
         print("\ntalking to a running subagent")
         messaging_unit()
         messaging_live(ex)
-        inbox_in_kernel()
+        no_inbox_left()
         reset_registry()
         print("\nstopping one")
         killing(ex)

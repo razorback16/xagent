@@ -60,6 +60,37 @@ Credentials go in `.env` (gitignored) or the environment:
 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-…     # or ANTHROPIC_API_KEY
 ```
 
+## Two ways to run it
+
+```bash
+uv run xagent                              # a session: type, read, reply
+uv run xagent "count the python files"     # one prompt, one answer, exit
+uv run xagent -I "start on the parser"     # a session, seeded with that prompt
+```
+
+A session is a conversation. The agent answers, the prompt comes back to you, and
+your reply lands in the same context with the same kernel behind it — every variable
+still bound, every file still written. The context is the shape a chat actually has:
+
+```
+you → cell → output → cell → output → answer → you → cell → output → answer → …
+```
+
+**You do not have to wait for it to finish.** Type while it works and press enter: the
+message is queued and delivered at the next turn boundary as a real `user` message,
+which is the same path a parent's `send()` takes to a subagent. The turn under way
+runs its cell first, so nothing is lost to the interruption.
+
+**Esc stops the cell, not the session.** It interrupts whatever the kernel is running
+and ends the response there. The namespace is untouched, and your next prompt carries
+on from it.
+
+`Ctrl-D` or `/exit` ends the session and closes the kernel. `/ctx` prints what the
+context currently costs.
+
+The one-prompt form is unchanged and takes no input layer at all, so piping and
+scripting behave exactly as they did. A redirected stdin always takes that path.
+
 ## Providers
 
 Chosen explicitly with `-p`, not inferred from the model name.
@@ -199,19 +230,16 @@ compress()                 # queue a compaction, applied after this cell
 agent(prompt, seed=…)      # subagent: own kernel, own context window
 gather(handles)            # blocks, preserves input order; no wall clock
 poll(handles=None)         # where every subagent has got to; never blocks
-send(handle, text)         # lands as an inbox() cell at its next turn
+send(handle, text)         # lands as a user message at its next turn
 kill(handle, reason="")    # stops it there, keeping what it produced
-inbox()                    # in a subagent: what the parent has sent you
 done(value)                # in a subagent: plain data back to the parent
 ```
 
-There are two *tools*, and only for the top-level agent: `python(code, timeout=180)`,
-and `done` — which takes no arguments and ends the run. A cell is interrupted after
-180 seconds and the namespace survives it, but a step the model already knows is slow
-— a build, an install, a long batch — says so in the call rather than discovering the
-wall by hitting it: `timeout` is an optional argument on every `python` call, clamped
-at an hour. Everything above is an
-ordinary function in the kernel namespace. The system prompt carries this listing
+There is one *tool*: `python(code, timeout=180)`. A cell is interrupted after 180
+seconds and the namespace survives it, but a step the model already knows is slow — a
+build, an install, a long batch — says so in the call rather than discovering the wall
+by hitting it: `timeout` is an optional argument on every `python` call, clamped at an
+hour. Everything above is an ordinary function in the kernel namespace. The system prompt carries this listing
 with signatures, generated at import time by introspecting the live objects, so it
 cannot drift from the code; `helpers()` prints the same listing back in-kernel.
 
@@ -240,16 +268,18 @@ the totals are not the question.
 
 **Finishing is asymmetric, because the two callers are.** A person is waiting for
 the top-level agent, and its answer is prose it must generate either way — so it
-writes the answer as ordinary text and calls the argument-free `done` tool beside
-it. Models are trained to end runs with a tool call, and giving them a legal way to
-do it deletes a whole class of corrections that used to cost a turn each.
+writes the answer as ordinary text and calls nothing. A turn with a `python` call is
+the model still working; a turn without one is the answer, and the prompt returns to
+the person. There is no finish tool, which is one fewer thing that can go wrong: a
+model that ends a turn on a final answer, which is what they are trained to do, is
+already right.
 
 A subagent is answering a program, and its result is an object in its kernel —
 often one it never saw whole, because the display is capped. It keeps the in-kernel
 `done(value)`: it hands back a *name*, cloudpickle moves the real object, and the
 cost is ~10 output tokens no matter how large the value. A tool argument would be
 JSON the model has to type out, which for a value it only saw a `<list len=1,847>`
-handle of means fabricating it. That is why subagents are offered no `done` tool.
+handle of means fabricating it. That is the one asymmetry worth having.
 
 ## A subagent has no clock, so the parent talks to it instead
 
@@ -271,17 +301,17 @@ three ways to reach a running one, none of which blocks.
 ```python
 h = agent("port the mixer to SDL3", label="mixer")
 poll()                        # state, turn, tokens, and the last words it wrote
-send(h, "skip the tests")     # arrives as an inbox() cell at its next turn
+send(h, "skip the tests")     # arrives as a user message at its next turn
 kill(h, "wrong approach")     # stops it there; its partial work is reported
 ```
 
-**A message is a cell the child genuinely ran.** The text goes into the child's
-kernel and the harness executes `inbox()` there at the end of the current turn, so
-what lands in the transcript is an ordinary REPL block — it renders like every other
-cell, survives compaction like every other cell, and nothing downstream had to learn
-about a second kind of message. Nothing is fabricated into the assistant's mouth: the
-model did not write that call, and its turn id says so. Delivery costs at most one
-turn of latency.
+**A message is a message.** It lands in the child's conversation as a real
+`user`-role message, wrapped in `<message-from-parent>`, at the end of the current
+turn — the same path a person's words take to the top-level agent, and the same code
+delivers both. Nothing is fabricated into the child's mouth and nothing is disguised
+as code it never wrote. Compaction leaves it alone, because an instruction from
+whoever the work is for is the least droppable thing in the window. Delivery costs at
+most one turn of latency.
 
 **A kill keeps the work.** It sets an event the child checks at every turn boundary
 *and* interrupts the child's kernel, so a child sitting in a long cell stops at once
@@ -371,7 +401,8 @@ uv run python tests/test_mechanics.py      # 59 checks, no API calls
 uv run python tests/test_sampling.py       # 66 checks, no API calls
 uv run python tests/test_vision.py         # 16 checks, no API calls
 uv run python tests/test_audio.py          # 60 checks, no API calls
-uv run python tests/test_finishing.py      # 105 checks, no API calls
+uv run python tests/test_finishing.py      # the answering contract, no API calls
+uv run python tests/test_session.py        # the conversation, no API calls
 uv run python tests/test_subagents.py      # 212 checks, no API calls
 uv run python tests/test_pool.py           # 24 checks, no API calls
 uv run python tests/test_regressions.py    # 211 checks, pins reviewed defects
@@ -386,7 +417,7 @@ check names the bug it prevents from returning. `test_mechanics.py` covers the l
 below the model: state persistence, display
 capping, stdout head+tail elision, the harness-side backstop, timeout and interrupt
 recovery, the tool surface, the turn payload, the variable table, and crossing the
-process boundary. `test_finishing.py` drives the finishing contract end to end
+process boundary. `test_finishing.py` drives the answering contract end to end
 against a scripted provider and a real kernel, and `test_subagents.py` does the same
 for supervision: that an interrupt comes back out of `gather()` instead of being
 absorbed, that a message really becomes a cell the child ran, that a kill keeps the
@@ -474,12 +505,12 @@ five attempts on the same deadline-bounded backoff as a 429.
   never folded and a generated file body is emitted as a literal. Measure that one
   first. (M5 in the plan.)
 - **A message is delivered, not obeyed.** `send()` guarantees the text reaches the
-  child's transcript at its next turn boundary, and the subagent prompt says an
-  `inbox()` message outranks the task. Whether the model then does as it is told is
-  the model's business: measured against qwen, a child told mid-run to abandon its
-  task acknowledged the message in its return value and finished the original job
-  anyway. That is what `kill()` is for — it is the only control that does not depend
-  on the model agreeing.
+  child's conversation at its next turn boundary, and the subagent prompt says a
+  `<message-from-parent>` message outranks the task. Whether the model then does as it
+  is told is the model's business: measured against qwen, a child told mid-run to
+  abandon its task acknowledged the message in its return value and finished the
+  original job anyway. That is what `kill()` is for — it is the only control that does
+  not depend on the model agreeing. The same caveat applies to a person mid-response.
 - **Fan-out is untested at scale.** A `gather()` over many subagents can outlive the
   default 180s cell timeout — the handles survive that interrupt, so `poll()` and a
   later `gather()` pick them up — but nothing yet proves the O(1)-context claim at
@@ -493,7 +524,7 @@ src/xagent/
   runtime.py   the model-facing surface           — runs inside the kernel
   kernel.py    jupyter_client wrapper, one per agent; strips the turn payload
   pool.py      warm kernels, so spawning a subagent does not wait for one
-  context.py   cells -> messages, cache breakpoints
+  context.py   cells and marks -> messages, cache breakpoints
   vision.py    local and REPL image content blocks
   audio.py     decode, measure and draw sound; the `listen()` handle
   plot.py      a raster canvas and a PNG encoder, so audio needs no matplotlib
@@ -501,7 +532,8 @@ src/xagent/
   asr.py       local 8-bit Nemotron ASR — written, not yet wired in
   compress.py  fold / evict / variable table
   provider.py  Anthropic-compatible adapter, both backends
-  runner.py    the sample -> execute -> append loop
+  runner.py    the sample -> execute -> append loop; start/ask/close
+  session.py   the interactive terminal: input box, queued messages, esc
   spawn.py     subagents, cloudpickle seeding
   prompts.py   the system prompt
   cli.py       entry point, and the rich-rendered transcript

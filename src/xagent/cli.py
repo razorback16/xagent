@@ -384,22 +384,15 @@ def make_printer(colour, verbose: bool, live_updates: bool = True):
                 block = Code(renderer, *SECTIONS["code"])
                 block.feed(code.strip())
                 block.close()
-        elif kind == "answer_start":
+        elif kind == "prompt":
             close_section()
-            live["streamed"] = False
-            live["think_chars"] = 0
-            if data.get("ask"):
-                # The `← output` printed above is not what the model read -- the
-                # fallback overwrote it on the way in, and a transcript that shows
-                # only the first version explains the answer by a prompt that was
-                # never sent. Show the replacement, not the cell a second time.
-                print(c("  ← output rewritten for the answer turn", "yellow"))
-                print(indent(data["ask"], c("  │ ", "yellow"), 2000))
-            print(c("\n─── answer", "dim"))
-        elif kind == "answer":
-            close_section()
-            if not live["streamed"] and data.get("text"):
-                show(data["text"], "text", 4000)
+            # A message that reached the run at a turn boundary: the person's own
+            # words, or a parent's to its subagent. Printed because the transcript
+            # has to show what the model was told and when -- the answer below it is
+            # a reply to this, not to the task at the top.
+            who = "you" if data.get("tag") == "user-message" else "parent"
+            print(c(f"\n▸ {who}", "green"))
+            print(indent(data["text"], c("  │ ", "green"), 2000))
         elif kind == "cell":
             close_section()
             colour_name = "dim" if data["ok"] else "red"
@@ -426,8 +419,13 @@ def main(argv: list[str] | None = None) -> int:
         prog="xagent",
         description="An LLM harness whose context window is a Python REPL.",
     )
-    parser.add_argument("task", nargs="?", help="what the agent should do")
+    parser.add_argument("task", nargs="?",
+                        help="what the agent should do. Omit it to open a session "
+                             "and type instead")
     parser.add_argument("-f", "--task-file", help="read the task from a file")
+    parser.add_argument("-I", "--interactive", action="store_true",
+                        help="start a session even with a task on the command line, "
+                             "so you can reply to the answer and keep the kernel")
     parser.add_argument("-i", "--image", action="append", dest="images", metavar="PATH",
                         help="attach a local image (repeat for multiple images)")
     parser.add_argument("-a", "--audio", action="append", dest="audio", metavar="PATH",
@@ -468,7 +466,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.task:
         task = args.task
     else:
-        parser.error("provide a task, or -f/--task-file")
+        task = None
+
+    # A session needs somewhere to read from, so a redirected stdin is always the
+    # one-prompt path however it was asked for. That also keeps `xagent "…" | tee`
+    # and every script that shells out to it behaving exactly as before.
+    interactive = (args.interactive or task is None) and sys.stdin.isatty()
+    if task is None and not interactive:
+        parser.error("provide a task, or -f/--task-file (stdin is not a terminal, "
+                     "so there is nothing to open a session on)")
 
     try:
         images = normalize_images(args.images)
@@ -507,6 +513,23 @@ def main(argv: list[str] | None = None) -> int:
     for clip in audio:
         print(c(f"♪ {clip.summary()}", "dim"))
 
+    printer = make_printer(colour, args.verbose, live_updates=sys.stdout.isatty())
+
+    if interactive:
+        from xagent.session import Session, UserChannel
+
+        channel = UserChannel()
+        runner = Runner(
+            # Empty when the person has not typed anything yet: their first message
+            # then opens the conversation the way the argument would have, rather than
+            # being folded into a `<task>` block that was never written.
+            task or "",
+            provider=provider, images=images, audio=audio, cwd=args.cwd,
+            max_turns=args.max_turns, budget=args.budget,
+            on_event=printer, channel=channel,
+        )
+        return Session(runner, colour=colour, paint=c).run(first=task)
+
     runner = Runner(
         task,
         provider=provider,
@@ -515,7 +538,7 @@ def main(argv: list[str] | None = None) -> int:
         cwd=args.cwd,
         max_turns=args.max_turns,
         budget=args.budget,
-        on_event=make_printer(colour, args.verbose, live_updates=sys.stdout.isatty()),
+        on_event=printer,
     )
     result = runner.run()
 
@@ -526,10 +549,9 @@ def main(argv: list[str] | None = None) -> int:
         print(c(f"✓ {result.finish}", "green"))
     if result.degraded:
         print(c("  (value could not be serialized — shown as a rendering)", "yellow"))
-    # The answer has already been on screen: it streamed as it was written, under
-    # its own header. Reprinting it here would show the deliverable twice. What is
-    # left to print is a value passed to done() by a run that produced no prose --
-    # a subagent-shaped finish at the top level, or an answer turn that failed.
+    # The answer has already been on screen: it streamed as it was written. Reprinting
+    # it here would show the deliverable twice. What is left to print is a value from
+    # a run that produced no prose -- a subagent-shaped finish at the top level.
     if not result.answer and result.value is not None:
         print()
         renderer = Renderer(colour)

@@ -180,11 +180,11 @@ def main() -> int:
         check("probe_pickle returns a real object", value == {"n": 7, "items": [0, 1, 2, 3, 4]}, repr(value))
 
         # done() is the subagent's finish, so it only signals at depth > 0. At the
-        # top level a person is waiting and the run ends on the `done` tool, which
-        # the harness sees itself -- in-kernel it does nothing but redirect.
+        # top level a person is waiting and the response ends on a turn that calls
+        # nothing, which the harness sees itself -- in-kernel this only redirects.
         out = k.execute("done({'answer': 42})")
-        check("done() at depth 0 redirects to the tool", "`done` tool" in out.render(),
-              out.render()[:200])
+        check("done() at depth 0 redirects to a tool-free turn",
+              "no tool call" in out.render(), out.render()[:200])
         sig = json.loads(k.probe("import xagent.runtime as _r; print(_r._signals())"))
         check("done() at depth 0 cannot end the run", sig["done"] is False, str(sig))
 

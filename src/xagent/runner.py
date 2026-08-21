@@ -1,4 +1,10 @@
-"""The agent loop: render context -> sample code -> execute -> append cell."""
+"""The agent loop: render context -> sample code -> execute -> append cell.
+
+A run is a conversation rather than a single errand. `ask()` produces one response
+to one prompt and leaves the kernel and the context standing; the caller can ask
+again, and the namespace the last answer was built from is still there. `run()` is
+the one-prompt case, unchanged for every caller that only ever wanted that.
+"""
 
 from __future__ import annotations
 
@@ -51,11 +57,11 @@ DONE_EXPR = "__import__('xagent.runtime', fromlist=['_STATE'])._STATE['done'][0]
 
 
 
-# A trailing `done()` the model typed into its prose as well as into the tool call:
-# punctuation it narrated rather than part of what it was telling anyone. Finishing
-# is a tool now, so nothing has to be unpicked to make the turn work -- but models
-# trained on the older spelling still narrate it, and a person reading the answer
-# should not be shown a function call where the last sentence belongs.
+# A trailing `done()` the model typed into its prose: punctuation it narrated rather
+# than part of what it was telling anyone. Nothing has to be unpicked to make the
+# turn work -- a response ends on a turn that calls nothing -- but models trained on
+# the older spelling still narrate it, and a person reading the answer should not be
+# shown a function call where the last sentence belongs.
 TRAILING_DONE = re.compile(r"(?:\n+\s*(?:```\w*\s*)?`?done\(\s*\)`?\s*(?:```)?\s*)+\Z")
 
 
@@ -79,7 +85,7 @@ class RunResult:
     usage: object = None
     compactions: list = field(default_factory=list)
     seconds: float = 0.0
-    finish: str = ""  # answered | done | max_turns | error
+    finish: str = ""  # answered | done | max_turns | interrupted | killed | error
 
     @property
     def ok(self) -> bool:
@@ -105,7 +111,7 @@ class Runner:
         is_subagent: bool = False,
         budget: int | None = None,
         on_event=None,
-        link=None,
+        channel=None,
     ):
         self.task = task
         self.provider = provider or Provider(backend=backend, model=model,
@@ -117,14 +123,17 @@ class Runner:
         self.images: list[ImageAttachment] = normalize_images(images)
         self.audio: list[AudioAttachment] = normalize_audio(audio)
         self.cwd = str(cwd or Path.cwd())
-        # The parent's end of this run, when there is a parent: its mailbox, its
-        # kill switch, and where to publish this run's kernel so a kill can
-        # interrupt the cell it is in the middle of. None at the top level, where
-        # the person watching talks to the harness instead. See spawn._Link.
-        self.link = link
-        # Delivered parent messages, counted so each one gets a cell id and a turn
-        # id of its own.
-        self._injected = 0
+        # Whoever can reach this run while it works: the person at the terminal, or
+        # the parent that spawned it. One protocol for both -- messages to deliver,
+        # a switch that ends the current response, and somewhere to publish the
+        # kernel so a stop can interrupt the cell it is in the middle of. None means
+        # nobody is listening and nothing can arrive. See spawn._Link and
+        # session.UserChannel.
+        self.channel = channel
+        # What a message from the channel is wrapped in. The two callers are not
+        # alike and the model is owed the difference: one is the person the work is
+        # for, the other is the agent that scoped it.
+        self._prompt_tag = "message-from-parent" if is_subagent else "user-message"
         self.on_event = on_event or (lambda *_a, **_k: None)
         if budget is not None and budget <= 0:
             raise ValueError(f"budget must be positive, got {budget}")
@@ -142,16 +151,26 @@ class Runner:
             replay_thinking=self.provider.backend.replay_thinking and bool(self.provider.thinking),
         )
         self.compressor = Compressor(self.provider, budget=self.budget)
-        # Only the top level is offered `done` as a tool. A subagent finishes by
-        # value from inside its kernel, and a tool argument could not carry what
-        # it returns -- see runtime.done().
-        self.provider.offer_done = not is_subagent
+        # Which rendering of the python tool description goes out. Only a subagent
+        # is told about in-kernel `done` -- see runtime.done().
+        self.provider.is_subagent = is_subagent
         self.kernel: Kernel | None = None
         self._seed_file: str | None = None
         # Wall-clock origin and the last context reading, both for the status line
         # every cell output carries.
         self._run_started = time.monotonic()
         self._last_used = 0
+        # Session-wide, so the limits mean the same thing however many prompts the
+        # conversation takes: turns counted from the first, and the soft ceiling
+        # _extend_turns() raises a block at a time.
+        self._turn_no = 0
+        self._limit = max_turns
+        self._empty = 0
+        self._warned_stalled = False
+        # How many prompts this run has answered. It starts at 1 for a session opened
+        # with no task, because the first thing the person says is then a message like
+        # any other -- there is no `<task>` block already holding it.
+        self._asked = 0 if task.strip() else 1
         # What the loop has produced so far, reachable from run() so a crash
         # reports the work instead of an empty result.
         self._result: RunResult | None = None
@@ -202,31 +221,60 @@ class Runner:
 
     # --------------------------------------------------------------------- run
 
+    @property
+    def turns(self) -> int:
+        """Turns sampled across the whole conversation, not just the last response."""
+        return self._turn_no
+
+    def start(self) -> None:
+        """Acquire the kernel. Idempotent, so `ask()` can call it blindly."""
+        if self.kernel is not None:
+            return
+        # The seed file is written by _kernel_env() and read at bootstrap, which
+        # acquire() runs inside adopt() -- so the ordering the cold path had is
+        # exactly preserved.
+        self.kernel = pool.acquire(cwd=self.cwd, env=self._kernel_env())
+        if self.channel is not None:
+            self.channel.attach(self.kernel)
+        self._emit("kernel_ready", depth=self.depth)
+
     def run(self) -> RunResult:
+        """One prompt, one response, and the kernel torn down after it."""
+        try:
+            return self.ask(self.task)
+        finally:
+            self.close()
+
+    def ask(self, text: str, *, images=None, audio=None) -> RunResult:
+        """Produce one response to one prompt.
+
+        The kernel and the context survive it, so the caller can ask again and the
+        namespace the last answer was built from is still standing. The first prompt
+        is already the `<task>` block at the head of the conversation; adding a mark
+        for it as well would say the same thing twice and cost the cached opening.
+        """
         started = time.monotonic()
-        self._run_started = started
         result = RunResult()
         try:
-            # The seed file is written by _kernel_env() and read at bootstrap,
-            # which acquire() runs inside adopt() -- so the ordering the cold path
-            # had is exactly preserved.
-            self.kernel = pool.acquire(cwd=self.cwd, env=self._kernel_env())
-            if self.link is not None:
-                self.link.attach(self.kernel)
-            self._emit("kernel_ready", depth=self.depth)
+            self.start()
+            if self._asked:
+                if extra := normalize_images(images):
+                    self.images.extend(extra)
+                if clips := normalize_audio(audio):
+                    self.audio.extend(clips)
+                self._deliver(text)
+            self._asked += 1
             result = self._loop()
         except KeyboardInterrupt:
             # Ctrl-C used to leave a traceback and nothing else: the turns, the
             # cells and the paragraph the person had just watched being written
-            # all went with it. An interrupted run is a partial result, not a
+            # all went with it. An interrupted response is a partial result, not a
             # crash, and it is reported as one.
             result = self._result or result
             result.finish = "interrupted"
             result.turns = len(self.store.cells)
             result.error = f"interrupted at turn {result.turns}"
-            result.last_text = strip_trailing_done(self._last_text)
-            if not result.answer and not self.is_subagent:
-                result.answer = result.last_text
+            self._salvage(result)
         except Exception as e:
             # Everything the loop had accumulated used to die with the exception:
             # `result` was still the empty one built above, so a run that fell over
@@ -237,18 +285,28 @@ class Runner:
             result.error = f"{type(e).__name__}: {e}"
             result.finish = "error"
             result.turns = len(self.store.cells)
-            result.last_text = strip_trailing_done(self._last_text)
-            if not result.answer and not self.is_subagent:
-                # The prose from the last turn that wrote any is a partial answer
-                # the person watched being written; a crash is no reason to
-                # pretend it never arrived.
-                result.answer = strip_trailing_done(self._last_text)
+            self._salvage(result)
         finally:
             result.seconds = time.monotonic() - started
             result.usage = self.provider.usage
             result.compactions = self.compressor.events
-            self._cleanup()
         return result
+
+    def _salvage(self, result: RunResult) -> None:
+        """Keep the prose a failed or interrupted response had already written.
+
+        A crash is no reason to pretend the paragraph the person watched being
+        written never arrived, and the next prompt needs it in the context or the
+        conversation reads as a question with no reply.
+        """
+        result.last_text = strip_trailing_done(self._last_text)
+        if not self.is_subagent and not result.answer:
+            result.answer = result.last_text
+        if result.answer:
+            self.store.add_answer(result.answer)
+
+    def close(self) -> None:
+        self._cleanup()
 
     def _cleanup(self) -> None:
         if self.kernel:
@@ -271,27 +329,26 @@ class Runner:
     def _loop(self) -> RunResult:
         result = self._result = RunResult()
         assert self.kernel is not None
-        empty = 0
-        warned_stalled = False
         # Prose from a turn the harness refused to run: an answer the model has
-        # already written, one rejection away from the call that finishes.
+        # already written, one rejection away from the turn that ends the response.
         stranded = ""
 
-        # The most recent prose of the whole run, kept for the turn-limit exit:
-        # a run that never called done() still wrote paragraphs worth salvaging.
+        # The most recent prose of this response, kept for the turn-limit exit: a
+        # response cut off there still wrote paragraphs worth salvaging.
         last_text = ""
 
-        # The soft limit, raised a block at a time by _extend_turns().
-        limit = self.max_turns
-        for turn_no in range(1, self.max_turns * MAX_TURN_BLOCKS + 1):
+        ceiling = self.max_turns * MAX_TURN_BLOCKS
+        while self._turn_no < ceiling:
+            self._turn_no += 1
+            turn_no = self._turn_no
             # The top of a turn is the end of the one before it: the last turn's
             # cells have run and nothing has been sampled yet. Checked here rather
             # than at the bottom of the body because the body has half a dozen
             # `continue`s in it, each of them the end of a turn too.
-            if self.link is not None and (stopped := self._boundary(result)):
+            if self.channel is not None and (stopped := self._boundary(result)):
                 return stopped
-            if turn_no > limit:
-                limit = self._extend_turns(limit)
+            if turn_no > self._limit:
+                self._limit = self._extend_turns(self._limit)
             # Announced before sampling, not after: on a long turn this header is
             # the only thing on screen until the first token arrives.
             self._emit("turn_start", n=turn_no, tokens=self.store.real_tokens)
@@ -305,13 +362,12 @@ class Runner:
             last_text = turn.text.strip() or last_text
             self._last_text = last_text
 
-            if self.link is not None and self.link.stopping:
-                # The kill landed while this turn was being generated. Its cells
+            if self.channel is not None and self.channel.stopping:
+                # The stop landed while this turn was being generated. Its cells
                 # have not run yet, and running them is exactly what was asked to
-                # stop -- so the prose above is the last thing this run says.
+                # stop -- so the prose above is the last thing this response says.
                 return self._killed(result)
 
-            finishing = turn.done and not self.is_subagent
             # Every `python` call the turn made, in order. More than one is a
             # model batching independent steps, which the kernel takes as it
             # takes any run of cells; the empty ones are dropped here so that a
@@ -319,37 +375,14 @@ class Runner:
             runnable = [c for c in turn.calls
                         if c.name == "python" and (c.code or "").strip()]
 
-            if finishing and not runnable:
-                # The finish arrived with no cell to run, so the run ends here on
-                # the prose beside it. Checked before the no-tool-call branch
-                # below, because extracting the `done` block is exactly what
-                # leaves this turn without a tool_use_id of its own.
-                if strays := self._strays(turn):
-                    # Reported, not acted on: nothing ran, and the finish is what
-                    # the turn was for.
-                    self._emit("warning", message=f"ignored extra tool call(s): {strays}")
-                if (turn.text.strip() or stranded):
-                    return self._finish(result, finish="done", text=turn.text,
-                                        carried=stranded)
-                # Finished having written nothing. Give _finish a cell to rewrite
-                # so the recovery turn has somewhere to put the ask; no `cell`
-                # event, because nothing ran for a reader to be shown.
-                blank = self.store.add(
-                    code="", output="", tool_use_id=turn.done_id or f"tu_{turn_no}",
-                    thought=turn.text, thinking_blocks=turn.thinking_blocks,
-                )
-                return self._finish(result, finish="done", text=turn.text,
-                                    carried=stranded, cell=blank)
-
             if not turn.calls:
-                # No tool call at all. Under the finishing contract the answer is
-                # the prose, and the call after it is only punctuation, so a model
-                # that writes the answer and stops has finished -- most of them do,
-                # having been trained to end a turn on a final answer. Take it.
-                # The cost of the reading is a model that stalls mid-task being
-                # recorded as having answered; the alternative is nudging a model
-                # that really has finished, in a loop it cannot escape.
-                result.value = turn.text.strip()
+                # No tool call at all, which is how a response ends: the prose is
+                # the answer, and there is no punctuation after it. The cost of the
+                # reading is a model that stalls mid-task being recorded as having
+                # answered -- but it is also what every model trained to end a turn
+                # on a final answer does, and the alternative is nudging one that
+                # really has finished, in a loop it cannot escape.
+                result.value = turn.text.strip() or stranded
                 result.brief = result.value[:400]
                 finish = "answered"
                 if not result.value:
@@ -363,7 +396,7 @@ class Runner:
                 # tool alongside a real one is handled after execution instead.
                 stranded = turn.text.strip() or stranded
                 self.store.add(
-                    code="", output=f"[unknown tool {turn.tool_name!r}. {self._only_tools()}; "
+                    code="", output=f"[unknown tool {turn.tool_name!r}. The only tool is `python`; "
                                     f"everything else is a function in the kernel, so send "
                                     f"`{turn.tool_name}(...)` as Python in the `code` "
                                     f"argument instead.]",
@@ -377,10 +410,10 @@ class Runner:
                 # A tool call arrived with empty arguments. Some Anthropic-compatible
                 # servers do this intermittently. It is recoverable: say so in the
                 # tool_result and let the model try again.
-                empty += 1
+                self._empty += 1
                 stranded = turn.text.strip() or stranded
-                if empty > MAX_EMPTY_CALLS:
-                    result.error = (f"{empty} consecutive empty tool calls from "
+                if self._empty > MAX_EMPTY_CALLS:
+                    result.error = (f"{self._empty} consecutive empty tool calls from "
                                     f"{self.provider.model}; giving up")
                     return self._finish(result, finish="error", text=turn.text,
                                         carried=stranded)
@@ -393,12 +426,13 @@ class Runner:
                     thinking_blocks=turn.thinking_blocks,
                     turn=turn_no,
                 )
-                self._emit("warning", message=f"empty tool call (attempt {empty}); retrying")
+                self._emit("warning",
+                           message=f"empty tool call (attempt {self._empty}); retrying")
                 continue
 
-            empty = 0
+            self._empty = 0
             # Stranded prose expires here, at the next cell that runs -- unless the
-            # turn finishes, which is the one turn it was being kept for.
+            # response ends, which is the one turn it was being kept for.
             carried, stranded = stranded, ""
             if len(runnable) > 1:
                 self._emit("note", message=(f"{len(runnable)} calls in this turn; "
@@ -433,7 +467,7 @@ class Runner:
                     # stops reaching for a tool it does not have, without costing it
                     # the cells it just wrote.
                     rendered += (f"\n\n[also called {dropped} in this turn — ignored. "
-                                 f"{self._only_tools()}.]")
+                                 f"The only tool is `python`.]")
                     self._emit("warning", message=f"ignored extra tool call(s): {dropped}")
                 if last and blank:
                     # A call with empty arguments beside calls that carried code.
@@ -501,51 +535,38 @@ class Runner:
                     result.value = self._pull_done(signals, result)
                     result.brief = signals.get("done_brief") or ""
                     return self._finish(result, finish="done", text=turn.text,
-                                        carried=carried, cell=cell)
-
-            if finishing:
-                # A `done` block beside a cell means "run this, then finish", and
-                # it means both halves -- so the cell above has already run. There
-                # is nothing to pull out of the kernel: a top-level finish carries
-                # no value, and `result.value` staying None is exactly right.
-                return self._finish(result, finish="done", text=turn.text,
-                                    carried=carried, cell=cell)
+                                        carried=carried)
 
             if self.compressor.should_compact(self.store):
                 for event in self.compressor.apply(self.store, self.kernel, mode="auto"):
                     self._emit("compaction", detail=str(event), requested=False)
-            elif self.compressor.stalled and not warned_stalled:
-                warned_stalled = True
+            elif self.compressor.stalled and not self._warned_stalled:
+                self._warned_stalled = True
                 self._emit("warning", message=(
                     f"over the {self.budget:,}-token budget but compaction cannot "
                     f"reclaim more — the floor (system prompt, task, pinned notes, "
                     f"protected tail) is already at the watermark. Raise --budget."))
 
-        # The run failed to finish and is reported as a failure, but the prose it
-        # wrote on the way is usually a real partial answer, and throwing it away
-        # left the person with an error where a paragraph they had just watched
-        # being written would do. It is not reprinted -- it streamed live -- so
-        # the error says where to look instead.
-        result.error = (f"hit the hard ceiling of "
-                        f"{self.max_turns * MAX_TURN_BLOCKS} turns "
+        # The response never ended on an answer and is reported as a failure, but
+        # the prose written on the way is usually a real partial one, and throwing
+        # it away left the person with an error where a paragraph they had just
+        # watched being written would do. It is not reprinted -- it streamed live --
+        # so the error says where to look instead.
+        result.error = (f"hit the hard ceiling of {ceiling} turns "
                         f"({MAX_TURN_BLOCKS} × {self.max_turns}, compacted at each "
-                        f"boundary) without finishing; the text above is a partial "
-                        f"answer from a run that never finished")
+                        f"boundary) without answering; the text above is a partial "
+                        f"answer from a response that never ended")
         return self._finish(result, finish="max_turns", text=last_text,
                             carried=stranded)
 
     def _finish(self, result: RunResult, *, finish: str, text: str = "",
-                carried: str = "", cell=None) -> RunResult:
+                carried: str = "") -> RunResult:
         """Resolve the answer the same way on every path out of the loop.
 
-        The exits each used to read the prose their own way, so the identical
-        turn finished differently depending on which one it took -- a `done()`
-        the model narrated as well as called survived into the answer when there
-        was no tool call to go with it, and prose stranded by a refused turn was
-        reachable from one finish and not from another. `cell` is the only thing
-        that legitimately varies: the fallback turn asks by rewriting a cell
-        output the model is about to read, so only a finish with a cell to spare
-        can offer it.
+        The exits each used to read the prose their own way, so the identical turn
+        finished differently depending on which one it took -- a `done()` the model
+        narrated survived into the answer on one path and not another, and prose
+        stranded by a refused turn was reachable from one exit and not from the next.
         """
         result.finish = finish
         # Recorded on every path, both roles: `answer` is what a person reads and
@@ -555,143 +576,83 @@ class Runner:
         result.last_text = strip_trailing_done(self._last_text)
         if self.is_subagent:
             # Its caller is a program, `value` is the whole of what crosses back,
-            # and there is nobody at the other end to read a paragraph -- least of
-            # all worth a request of its own.
+            # and there is nobody at the other end to read a paragraph.
             result.answer = ""
             return result
-        # The prose the model wrote beside the call is the answer. It already
-        # streamed, it cost no extra request, and asking for it again only
-        # produces the same paragraph twice. The tool-free turn is the fallback
-        # for a model that called `done` having said nothing -- a person is still
-        # owed an answer.
-        result.answer = strip_trailing_done(
-            (text or "").strip() or carried
-            or (self._answer(cell) if cell is not None else ""))
+        # The prose the turn wrote is the answer. It already streamed and it cost no
+        # extra request; `carried` picks up prose the harness refused to act on, so a
+        # paragraph one rejected turn back is not lost.
+        result.answer = strip_trailing_done((text or "").strip() or carried)
+        if result.answer:
+            # Recorded in the context, so the next prompt has a reply to follow and
+            # the conversation does not read as a list of unanswered questions.
+            self.store.add_answer(result.answer)
         return result
 
-    def _answer(self, cell) -> str:
-        """Ask for the answer a top-level run finished without writing.
-
-        The contract is that the model writes its conclusion as ordinary text and
-        calls the `done` tool in the same turn, so this is the recovery path: it
-        sent the full stop with nothing in front of it. Sampling once more with
-        the tools withheld leaves it nothing to do but write the answer. Subagents
-        never reach here -- their caller is a program, and `value` is the answer.
-
-        The ask replaces a cell output the model is about to read. When the finish
-        arrived alone there was no cell, so the loop adds an empty one purely to
-        carry this: it exists for the length of one request and is never shown.
-        """
-        cell.output = ("[done] the run ended with no answer written. Write it now, "
-                       "as ordinary text: no tool, no code, just the answer for the "
-                       "person who asked.")
-        # The cell event went out with the real output, a turn's worth of screen
-        # ago; the rewrite above lands after anyone reading along has been shown
-        # something else. Carrying the ask on the header for the turn it provoked
-        # is what stops the transcript from crediting the answer to a prompt the
-        # model was never given.
-        self._emit("answer_start", ask=cell.output)
-        try:
-            turn = self.provider.sample(
-                self.store.system, self.store.messages(), tools=False)
-        except Exception as e:
-            # Never fatal. The work is done and the transcript holds it; losing the
-            # closing paragraph is not worth discarding the run over.
-            self._emit("warning", message=f"final answer turn failed ({type(e).__name__}: {e})")
-            return ""
-        self._emit("answer", text=turn.text)
-        return turn.text.strip()
-
-    # --------------------------------------------------------------- the parent
+    # -------------------------------------------------------------- the channel
 
     def _boundary(self, result: RunResult) -> RunResult | None:
-        """Let the parent get a word in, between one turn and the next.
+        """Let whoever is watching get a word in, between one turn and the next.
 
-        A subagent runs for as long as its job takes, so the parent has no wall
-        clock to intervene with -- it talks instead. Everything it has sent since
-        the last turn is delivered here, and a kill it asked for ends the run here
-        rather than at whatever happened to check next.
+        A run takes as long as its job takes, so there is no wall clock to intervene
+        with -- the person, or the parent, talks instead. Everything sent since the
+        last turn is delivered here, and a stop that was asked for ends the response
+        here rather than at whatever happened to check next.
         """
-        if self.link.stopping:
+        if self.channel.stopping:
             return self._killed(result)
-        for text in self.link.drain():
+        for text in self.channel.drain():
             self._deliver(text)
-            if self.link.stopping:
-                # A kill queued behind the message it followed. Deliver nothing
-                # further; the run is over.
+            if self.channel.stopping:
+                # A stop queued behind the message it followed. Deliver nothing
+                # further; the response is over.
                 return self._killed(result)
         return None
 
     def _deliver(self, text: str) -> None:
-        """Hand the child its parent's message as a cell it genuinely ran.
+        """Put a message into the context as the user message it is.
 
-        Deliberately not a fabricated tool_use: the text goes into the kernel and
-        `inbox()` prints it, so what lands in the transcript is an ordinary REPL
-        block. It renders like every other cell, it survives compaction like every
-        other cell, and nothing downstream has to learn about a second kind of
-        message.
+        It used to arrive as a fabricated `inbox()` cell -- a person's words dressed
+        as a REPL block the model never wrote, which is exactly the confusion the
+        transcript should not contain. A `Mark` renders as a real `user` message, and
+        compaction leaves it alone: an instruction from whoever the work is for is
+        the least droppable thing in the window.
         """
-        assert self.kernel is not None
-        self._injected += 1
-        try:
-            # A probe rather than a push: everywhere else a lost write costs a
-            # context refresh, and here it would show the model an empty inbox and
-            # drop the parent's message without saying so.
-            self.kernel.probe(f"import xagent.runtime as _r; _r._deliver({text!r})",
-                              timeout=30)
-        except Exception as e:
-            self._emit("warning", message=(f"a message from the parent could not be "
-                                           f"delivered ({type(e).__name__}: {e})"))
+        text = str(text).strip()
+        if not text:
             return
-        started = time.time()
-        output = self.kernel.execute("inbox()")
-        cell = self.store.add(
-            code="inbox()",
-            output=output.render(),
-            tool_use_id=f"tu_inbox_{self._injected}",
-            # A turn id no sampled turn can hold, so this is never folded into the
-            # assistant message of the turn beside it. The model did not ask for
-            # this cell and must not be shown as having asked for it.
-            turn=-self._injected,
-        )
-        cell.output += "\n\n" + self._status_line(time.time() - started)
-        if self._result is not None:
-            self._result.turns = len(self.store.cells)
-        self._emit("cell", n=cell.n, output=cell.output, ok=output.ok)
+        self.store.add_prompt(text, tag=self._prompt_tag)
+        self._emit("prompt", text=text, tag=self._prompt_tag)
 
     def _killed(self, result: RunResult) -> RunResult:
-        """End where the parent asked, keeping everything the run produced.
+        """End where the stop asked, keeping everything the response produced.
 
-        The same salvage as the crash path in run(): a child killed at turn forty
-        has forty turns of work and a paragraph behind it, and reporting the kill
-        with none of it is how a parent loses the only account of what its
-        subagent got to before it changed its mind.
+        The same salvage as the crash path in ask(): a child killed at turn forty has
+        forty turns of work and a paragraph behind it, and reporting the stop with
+        none of it is how a parent loses the only account of what its subagent got to
+        before it changed its mind.
         """
-        reason = self.link.stop_reason
-        result.finish = "killed"
-        result.error = "killed by parent: " + (reason or "no reason given")
+        reason = self.channel.stop_reason
+        result.finish = self.channel.stop_finish
+        result.error = f"{self.channel.stop_label}: " + (reason or "no reason given")
         result.turns = len(self.store.cells)
         result.last_text = strip_trailing_done(self._last_text)
         if not self.is_subagent:
             result.answer = result.answer or result.last_text
-        self._emit("note", message=f"stopped by the parent: {reason or 'no reason given'}")
+            if result.answer:
+                self.store.add_answer(result.answer)
+        self._emit("note", message=(f"{self.channel.stop_label}: "
+                                    f"{reason or 'no reason given'}"))
         return result
 
     # ----------------------------------------------------------------- helpers
-
-    def _only_tools(self) -> str:
-        """How to name the tool surface when correcting a model that missed it."""
-        if self.is_subagent:
-            return "The only tool is `python`"
-        return "The only tools are `python` and `done`"
 
     def _strays(self, turn) -> str:
         """Tool calls in this turn that ran nothing, as a printable list.
 
         Every `python` block in the turn runs, so what is left is a tool that does
-        not exist. `done` never appears here either: the provider extracts it
-        before anything competes for a slot, because it is the turn saying it is
-        the last one rather than a call that wanted running.
+        not exist -- including `done`, which a model trained on the older contract
+        still reaches for and which is no longer offered at any depth.
         """
         names = list(turn.ignored_tools)
         names += [c.name for c in turn.calls if c.name != "python"]

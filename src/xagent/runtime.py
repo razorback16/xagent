@@ -50,9 +50,6 @@ _STATE: dict = {
     "compress": None,
     "ctx": {},
     "spawned": 0,
-    # Messages the parent agent has sent, waiting for the inbox() cell the harness
-    # runs at the next turn boundary.
-    "inbox": [],
     # Armed by the harness before each model cell, disarmed by the hook that reads
     # it. Absent means "this cell is not one the harness is listening to", which is
     # true of every probe -- and is what keeps a probe's stdout free of payloads.
@@ -410,19 +407,19 @@ def done(value=None):
 
     The top-level agent reports to a person, and its answer is prose it has to
     write out either way. There is nothing for a value channel to carry, so that
-    run finishes through the `done` tool instead, and this function does nothing
-    at depth 0 but say so.
+    run ends its response by writing the answer and calling nothing, and this
+    function does nothing at depth 0 but say so.
     """
     if not _is_subagent():
         # Deliberately not raising and not signalling. A model reaching for the
-        # old spelling out of habit needs redirecting, not a traceback, and it
-        # must not be able to end the run from in here -- the run ends on the
-        # tool call, which is the one place the harness can see it coming.
+        # old spelling out of habit needs redirecting, not a traceback, and there
+        # is no run for it to end from in here: a response ends on a turn that
+        # calls nothing, which is the one thing the harness can see coming.
         extra = "" if value is None else (
             " The value would be read by nobody: write what matters into the answer."
         )
-        return ("[done() does not finish this run — write the answer as ordinary text "
-                "and call the `done` tool in the same turn.]" + extra)
+        return ("[done() does not end your response — write the answer as ordinary "
+                "text and make no tool call in that turn.]" + extra)
     _STATE["done"] = (value,)
     _STATE["finish"] = "done"
     # A parent may well read this one: it says what crossed back.
@@ -513,28 +510,6 @@ def kill(handle, reason: str = "") -> str:
     """Stop a subagent now, keeping the work it had already done."""
     return handle.kill(reason)
 
-
-def inbox() -> None:
-    """Read what the parent agent has sent you, and clear it.
-
-    The harness runs this as a cell of its own at a turn boundary whenever a
-    message has arrived, so you will usually be reading its output rather than
-    calling it -- but calling it costs nothing and is how you check.
-
-    What it prints is your parent talking to you mid-run: instructions that arrived
-    after the task you were given, and that outrank it where they disagree.
-    """
-    if not _is_subagent():
-        print("[inbox] nothing sends here — you are the top-level agent, and the "
-              "person you work for talks to you through the task.")
-        return
-    pending, _STATE["inbox"] = _STATE["inbox"], []
-    if not pending:
-        print("[inbox] no messages from your parent.")
-        return
-    print(f"[inbox] {len(pending)} message(s) from the parent that spawned you:")
-    for message in pending:
-        print(f"  {message}")
 
 
 # ------------------------------------------------------- harness-side hooks
@@ -669,16 +644,6 @@ def _emit_turn_payload(want_vars: bool = False) -> None:
     raw_write(json.dumps(_turn_payload(want_vars)))
 
 
-def _deliver(text: str) -> None:
-    """Queue a parent's message for the inbox() cell the harness runs next.
-
-    Pushed in by the harness on the child's behalf, ahead of that cell, for the
-    same reason `_arm_turn` is: what the parent said is something the harness
-    knows and this kernel does not.
-    """
-    _STATE["inbox"].append(str(text))
-
-
 def _spawn_count() -> int:
     try:
         from xagent import spawn as _s
@@ -748,7 +713,7 @@ def helpers() -> None:
 PUBLIC = [
     read, write, edit, ls, files, files_touched, grep, sh,
     peek, listen, note, ctx, compress, done,
-    agent, gather, poll, send, kill, inbox, helpers,
+    agent, gather, poll, send, kill, helpers,
     Result, Hit, Sound, AgentError,
 ]
 
